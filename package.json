@@ -1,0 +1,9 @@
+{
+  "name": "vercel-log-drain-receiver",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@google-cloud/logging": "^11.0.0",
+    "@google-cloud/functions-framework": "^3.3.0"
+  }
+}
