@@ -62,6 +62,9 @@ Resources:
       CodeUri: ./
       Handler: src/handlers/api.handler
       Description: CRUD API for trial reminders, exposed through a Lambda Function URL.
+      Environment:
+        Variables:
+          CORS_ALLOW_ORIGIN: !Ref CorsAllowOrigin
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref RemindersTable
@@ -106,7 +109,7 @@ Resources:
 
 Outputs:
   ApiFunctionUrl:
-    Description: Public Lambda Function URL - paste this into public/index.html.
+    Description: Public Lambda Function URL - enter this in the dashboard's "Lambda Function URL" field.
     Value: !GetAtt ApiFunctionUrl.FunctionUrl
   RemindersTableName:
     Description: DynamoDB table storing the reminders.

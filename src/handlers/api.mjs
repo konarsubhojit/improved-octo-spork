@@ -9,7 +9,7 @@ const MAX_NOTE_LENGTH = 500;
 const MAX_SERVICE_NAME_LENGTH = 120;
 
 const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Origin': process.env.CORS_ALLOW_ORIGIN || '*',
   'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };

@@ -38,20 +38,25 @@ export async function fetchPendingReminders(reminderDate) {
  * Marks a reminder as SENT, recording the delivery timestamp.
  */
 export async function markAsSent(reminder) {
-  await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE_NAME,
-      Key: { reminder_date: reminder.reminder_date, reminder_id: reminder.reminder_id },
-      UpdateExpression: 'SET #status = :sent, sentAt = :sentAt',
-      ConditionExpression: '#status = :pending',
-      ExpressionAttributeNames: { '#status': 'status' },
-      ExpressionAttributeValues: {
-        ':sent': 'SENT',
-        ':pending': 'PENDING',
-        ':sentAt': new Date().toISOString()
-      }
-    })
-  );
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { reminder_date: reminder.reminder_date, reminder_id: reminder.reminder_id },
+        UpdateExpression: 'SET #status = :sent, sentAt = :sentAt',
+        ConditionExpression: '#status = :pending',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':sent': 'SENT',
+          ':pending': 'PENDING',
+          ':sentAt': new Date().toISOString()
+        }
+      })
+    );
+  } catch (error) {
+    // Another concurrent run already marked this reminder as SENT - nothing to do.
+    if (error?.name !== 'ConditionalCheckFailedException') throw error;
+  }
 }
 
 export const handler = async () => {
