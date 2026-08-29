@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Trial Expiry Reminder - zero-cost serverless app (DynamoDB On-Demand, Lambda Function URL,
+  EventBridge daily schedule and Gmail SMTP notifications).
+
+Parameters:
+  GmailUser:
+    Type: String
+    Description: Gmail address used to send reminder emails (e.g. you@gmail.com).
+  GmailAppPassword:
+    Type: String
+    NoEcho: true
+    Description: 16-character Google App Password for the Gmail account.
+  CorsAllowOrigin:
+    Type: String
+    Default: '*'
+    Description: Origin allowed to call the API Function URL.
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures:
+      - arm64
+    MemorySize: 256
+    Timeout: 30
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref RemindersTable
+        STATUS_INDEX: StatusIndex
+
+Resources:
+  RemindersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: reminder_date
+          AttributeType: S
+        - AttributeName: reminder_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reminder_date
+          KeyType: HASH
+        - AttributeName: reminder_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: reminder_date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: src/handlers/api.handler
+      Description: CRUD API for trial reminders, exposed through a Lambda Function URL.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RemindersTable
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins:
+            - !Ref CorsAllowOrigin
+          AllowMethods:
+            - GET
+            - POST
+            - DELETE
+          AllowHeaders:
+            - content-type
+          MaxAge: 3600
+    Metadata:
+      BuildMethod: nodejs20.x
+
+  DailyNotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: src/handlers/notifier.handler
+      Description: Sends the reminder emails scheduled for the current UTC day.
+      Timeout: 300
+      Environment:
+        Variables:
+          GMAIL_USER: !Ref GmailUser
+          GMAIL_APP_PASSWORD: !Ref GmailAppPassword
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RemindersTable
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 9 * * ? *)
+            Name: trial-expiry-daily-notifier
+            Description: Runs every day at 09:00 UTC.
+    Metadata:
+      BuildMethod: nodejs20.x
+
+Outputs:
+  ApiFunctionUrl:
+    Description: Public Lambda Function URL - paste this into public/index.html.
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+  RemindersTableName:
+    Description: DynamoDB table storing the reminders.
+    Value: !Ref RemindersTable

@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trial Expiry Reminders</title>
+    <style>
+      :root { --brand: #4f46e5; --bg: #f4f4f7; --border: #e5e7eb; }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 24px; background: var(--bg); color: #1f2937;
+             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; }
+      main { max-width: 720px; margin: 0 auto; }
+      h1 { font-size: 24px; color: var(--brand); }
+      section { background: #fff; border-radius: 10px; padding: 20px; margin-bottom: 20px;
+                box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+      label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 4px; }
+      input, textarea, button { width: 100%; font: inherit; }
+      input, textarea { padding: 10px; border: 1px solid var(--border); border-radius: 6px; }
+      textarea { resize: vertical; min-height: 70px; }
+      button { margin-top: 16px; padding: 11px; border: 0; border-radius: 6px;
+               background: var(--brand); color: #fff; font-weight: 600; cursor: pointer; }
+      button:disabled { opacity: .6; cursor: not-allowed; }
+      .reminder { border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+                  margin-bottom: 10px; display: flex; gap: 12px; align-items: flex-start;
+                  justify-content: space-between; flex-wrap: wrap; }
+      .reminder h3 { margin: 0 0 4px; font-size: 16px; }
+      .reminder p { margin: 2px 0; font-size: 13px; color: #4b5563; }
+      .reminder blockquote { margin: 8px 0 0; padding: 6px 10px; border-left: 3px solid var(--brand);
+                             background: #f5f5ff; font-style: italic; font-size: 13px; }
+      .reminder button { width: auto; margin: 0; background: #dc2626; padding: 8px 14px; }
+      .status { margin-top: 12px; font-size: 14px; min-height: 20px; }
+      .status.error { color: #dc2626; }
+      .status.ok { color: #047857; }
+      .muted { color: #6b7280; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Trial Expiry Reminders</h1>
+
+      <section>
+        <label for="apiUrl">Lambda Function URL</label>
+        <input id="apiUrl" type="url" placeholder="https://xxxx.lambda-url.us-east-1.on.aws" />
+        <p class="muted">Saved in your browser. Use the <code>ApiFunctionUrl</code> stack output.</p>
+      </section>
+
+      <section>
+        <h2 style="margin-top:0;font-size:18px;">Add a reminder</h2>
+        <form id="reminderForm">
+          <label for="serviceName">Service name</label>
+          <input id="serviceName" maxlength="120" required placeholder="Netflix" />
+
+          <label for="expiryDate">Trial expiry date (UTC)</label>
+          <input id="expiryDate" type="date" required />
+
+          <label for="userEmail">Notify this email</label>
+          <input id="userEmail" type="email" required placeholder="you@example.com" />
+
+          <label for="customNote">Custom note (optional)</label>
+          <textarea id="customNote" maxlength="500" placeholder="Cancel from the billing page before renewal."></textarea>
+
+          <label for="offsets">Remind me this many days before expiry (comma separated)</label>
+          <input id="offsets" value="3,1,0" />
+
+          <button type="submit">Create reminder</button>
+        </form>
+        <p class="status" id="formStatus"></p>
+      </section>
+
+      <section>
+        <h2 style="margin-top:0;font-size:18px;">Pending reminders</h2>
+        <button id="refresh" style="width:auto;margin:0 0 12px;">Refresh</button>
+        <div id="list"><p class="muted">Nothing loaded yet.</p></div>
+      </section>
+    </main>
+
+    <script>
+      const apiUrlInput = document.getElementById('apiUrl');
+      const listEl = document.getElementById('list');
+      const formStatus = document.getElementById('formStatus');
+      const form = document.getElementById('reminderForm');
+
+      apiUrlInput.value = localStorage.getItem('trialReminderApiUrl') || '';
+      apiUrlInput.addEventListener('change', () => {
+        localStorage.setItem('trialReminderApiUrl', apiUrlInput.value.trim());
+        loadReminders();
+      });
+
+      function baseUrl() {
+        const url = apiUrlInput.value.trim().replace(/\/+$/, '');
+        if (!url) throw new Error('Set the Lambda Function URL first.');
+        return url;
+      }
+
+      function setStatus(message, kind) {
+        formStatus.textContent = message;
+        formStatus.className = 'status' + (kind ? ' ' + kind : '');
+      }
+
+      async function request(path, options) {
+        const res = await fetch(baseUrl() + path, options);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.message || 'Request failed (' + res.status + ')');
+        return data;
+      }
+
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const button = form.querySelector('button');
+        button.disabled = true;
+        try {
+          const offsets = document.getElementById('offsets').value
+            .split(',')
+            .map((value) => Number(value.trim()))
+            .filter((value) => Number.isInteger(value) && value >= 0);
+
+          const data = await request('/reminders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              serviceName: document.getElementById('serviceName').value,
+              expiryDate: document.getElementById('expiryDate').value,
+              userEmail: document.getElementById('userEmail').value,
+              customNote: document.getElementById('customNote').value,
+              reminderOffsets: offsets.length ? offsets : undefined
+            })
+          });
+          setStatus('Created ' + data.created + ' reminder(s).', 'ok');
+          form.reset();
+          document.getElementById('offsets').value = '3,1,0';
+          loadReminders();
+        } catch (error) {
+          setStatus(error.message, 'error');
+        } finally {
+          button.disabled = false;
+        }
+      });
+
+      document.getElementById('refresh').addEventListener('click', loadReminders);
+
+      async function loadReminders() {
+        listEl.textContent = 'Loading...';
+        try {
+          const data = await request('/reminders');
+          renderReminders(data.reminders || []);
+        } catch (error) {
+          listEl.innerHTML = '';
+          const p = document.createElement('p');
+          p.className = 'status error';
+          p.textContent = error.message;
+          listEl.appendChild(p);
+        }
+      }
+
+      function renderReminders(reminders) {
+        listEl.innerHTML = '';
+        if (!reminders.length) {
+          const empty = document.createElement('p');
+          empty.className = 'muted';
+          empty.textContent = 'No pending reminders.';
+          listEl.appendChild(empty);
+          return;
+        }
+
+        for (const reminder of reminders) {
+          const card = document.createElement('div');
+          card.className = 'reminder';
+
+          const info = document.createElement('div');
+          const title = document.createElement('h3');
+          title.textContent = reminder.serviceName;
+          const expiry = document.createElement('p');
+          expiry.textContent = 'Expires: ' + reminder.expiryDate;
+          const notifyOn = document.createElement('p');
+          notifyOn.textContent = 'Reminder on: ' + reminder.reminder_date + ' -> ' + reminder.userEmail;
+          info.append(title, expiry, notifyOn);
+
+          if (reminder.customNote) {
+            const note = document.createElement('blockquote');
+            note.textContent = reminder.customNote;
+            info.appendChild(note);
+          }
+
+          const remove = document.createElement('button');
+          remove.textContent = 'Delete';
+          remove.addEventListener('click', async () => {
+            remove.disabled = true;
+            try {
+              await request(
+                '/reminders/' + encodeURIComponent(reminder.reminder_date) +
+                  '/' + encodeURIComponent(reminder.reminder_id),
+                { method: 'DELETE' }
+              );
+              loadReminders();
+            } catch (error) {
+              setStatus(error.message, 'error');
+              remove.disabled = false;
+            }
+          });
+
+          card.append(info, remove);
+          listEl.appendChild(card);
+        }
+      }
+
+      if (apiUrlInput.value) loadReminders();
+    </script>
+  </body>
+</html>
