@@ -1,9 +1,16 @@
 {
-  "name": "vercel-log-drain-receiver",
+  "name": "trial-expiry-reminder",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "Zero-cost serverless trial expiry reminder app (AWS SAM + Lambda + DynamoDB + Gmail SMTP)",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
   "dependencies": {
-    "@google-cloud/logging": "^11.0.0",
-    "@google-cloud/functions-framework": "^3.3.0"
+    "@aws-sdk/client-dynamodb": "^3.1121.0",
+    "@aws-sdk/lib-dynamodb": "^3.1121.0",
+    "nodemailer": "^9.0.6",
+    "uuid": "^14.0.2"
   }
 }
