@@ -13,6 +13,7 @@
     "start:scheduler": "tsx src/runtime/scheduler.ts",
     "start:email-worker": "tsx src/runtime/email-worker.ts",
     "migrate": "tsx src/runtime/migrate.ts",
+    "inspect:schema": "node --env-file=.env --import tsx src/runtime/inspect-schema.ts",
     "bootstrap": "tsx src/runtime/bootstrap.ts"
   },
   "dependencies": {

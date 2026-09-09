@@ -806,14 +806,18 @@ export class OracleAppRepository implements AppRepository {
         const eventId = `reminder:${row.REMINDER_ID}:${row.SCHEDULE_VERSION}:${row.NEXT_DUE_AT.toISOString()}`;
         try {
           await connection.execute(
-            `INSERT INTO reminder_occurrences(workspace_id, occurrence_id, reminder_id, schedule_version, due_at)
-             VALUES(:workspace_id, :occurrence_id, :reminder_id, :schedule_version, :due_at)`,
+            `INSERT INTO reminder_occurrences(
+               workspace_id, occurrence_id, reminder_id, schedule_version, due_at, due_at_epoch
+             ) VALUES(
+               :workspace_id, :occurrence_id, :reminder_id, :schedule_version, :due_at, :due_at_epoch
+             )`,
             {
               workspace_id: row.WORKSPACE_ID,
               occurrence_id: occurrenceId,
               reminder_id: row.REMINDER_ID,
               schedule_version: row.SCHEDULE_VERSION,
-              due_at: row.NEXT_DUE_AT
+              due_at: row.NEXT_DUE_AT,
+              due_at_epoch: row.NEXT_DUE_AT.getTime()
             }
           );
           await connection.execute(
