@@ -56,6 +56,20 @@ END;
   assert.match(stmts[0]!, /^DECLARE[\s\S]*END;$/);
 });
 
+test('splitSqlScript keeps a declared procedure inside its anonymous PL/SQL block', () => {
+  const script = `DECLARE
+  PROCEDURE validate IS
+  BEGIN
+    NULL;
+  END;
+BEGIN
+  validate;
+END;
+/
+`;
+  assert.deepEqual(splitSqlScript(script), [script.trim().replace(/\n\/$/, '')]);
+});
+
 test('splitSqlScript treats semicolons inside quoted string literals as data, not terminators', () => {
   const stmts = splitSqlScript(`INSERT INTO t(v) VALUES ('a;b;c');\nINSERT INTO t(v) VALUES ('it''s; here');\n`);
   assert.equal(stmts.length, 2);
@@ -192,6 +206,59 @@ test('runMigrations never records a version when a statement in the file fails',
   assert.equal(commits, 0);
 });
 
+test('the real 001 resumes a partial schema, does not record on compatibility failure, and is a no-op after success', async () => {
+  const sql = await readFile(resolve(process.cwd(), 'migrations/001_mvp.sql'), 'utf8');
+  const executed: string[] = [];
+  let commits = 0;
+  const partialRows = [{ workspace_id: 'workspace-1', reminder_id: 'reminder-1' }];
+  const partial = fakeDeps({
+    files: { '001_mvp.sql': sql },
+    schemaMigrationsExists: async () => true,
+    listAppliedVersions: async () => [],
+    execute: async (statement) => {
+      executed.push(statement);
+    },
+    commit: async () => {
+      commits += 1;
+    }
+  });
+  await runMigrations(partial);
+  assert.equal(executed.length, 2, 'the real block and ledger MERGE must both execute for an empty ledger');
+  assert.equal(commits, 1);
+  assert.deepEqual(partialRows, [{ workspace_id: 'workspace-1', reminder_id: 'reminder-1' }], 'resume must not lose prior rows');
+
+  const failedStatements: string[] = [];
+  await assert.rejects(
+    () =>
+      runMigrations(
+        fakeDeps({
+          files: { '001_mvp.sql': sql },
+          schemaMigrationsExists: async () => true,
+          listAppliedVersions: async () => [],
+          execute: async (statement) => {
+            failedStatements.push(statement);
+            throw Object.assign(new Error('ORA-20006: incompatible DUE_AT_EPOCH column'), { errorNum: 20006 });
+          }
+        })
+      ),
+    /incompatible DUE_AT_EPOCH/
+  );
+  assert.equal(failedStatements.length, 1, 'a compatibility failure must stop before the version MERGE');
+
+  const noOpStatements: string[] = [];
+  await runMigrations(
+    fakeDeps({
+      files: { '001_mvp.sql': sql },
+      schemaMigrationsExists: async () => true,
+      listAppliedVersions: async () => [1],
+      execute: async (statement) => {
+        noOpStatements.push(statement);
+      }
+    })
+  );
+  assert.deepEqual(noOpStatements, [], 'a successfully recorded version must not replay 001');
+});
+
 test('runMigrations does not swallow an unrelated error (only Oracle itself may decide ORA-00955 is safe)', async () => {
   const deps = fakeDeps({
     files: { '001_mvp.sql': 'BEGIN NULL; END;\n/\n' },
@@ -295,6 +362,55 @@ test('migrations/001_mvp.sql declares a column count for every table matching it
     const actualCount = countTableColumns(ddl!);
     assert.equal(actualCount, declaredCount, `${name}: declared column count ${declaredCount} does not match DDL (${actualCount})`);
   }
+});
+
+test('migrations/001_mvp.sql uses UTC epoch keys instead of timezone-aware timestamps in unique constraints', async () => {
+  const sql = await readFile(resolve(process.cwd(), 'migrations/001_mvp.sql'), 'utf8');
+  const occurrence = sql.match(/CREATE TABLE reminder_occurrences \(([\s\S]*?)\)'/i)?.[1];
+  const checkRun = sql.match(/CREATE TABLE check_runs \(([\s\S]*?)\)'/i)?.[1];
+
+  assert.match(occurrence ?? '', /due_at TIMESTAMP\(3\) WITH TIME ZONE NOT NULL/);
+  assert.match(occurrence ?? '', /due_at_epoch NUMBER\(19\) NOT NULL/);
+  assert.match(occurrence ?? '', /UNIQUE \(workspace_id, reminder_id, schedule_version, due_at_epoch\)/);
+  assert.doesNotMatch(occurrence ?? '', /UNIQUE \([^)]*due_at\)/);
+  assert.match(checkRun ?? '', /slot_at TIMESTAMP\(3\) WITH TIME ZONE NOT NULL/);
+  assert.match(checkRun ?? '', /slot_at_epoch NUMBER\(19\) NOT NULL/);
+  assert.match(checkRun ?? '', /UNIQUE \(workspace_id, monitor_id, config_version, slot_at_epoch\)/);
+  assert.doesNotMatch(checkRun ?? '', /UNIQUE \([^)]*slot_at\)/);
+  assert.match(sql, /verify_epoch_deduplication\(/);
+  assert.match(sql, /failed creating ' \|\| v_name\(i\)/);
+});
+
+test('migrations/001_mvp.sql has no other timezone-aware timestamp in a primary or unique key', async () => {
+  const sql = await readFile(resolve(process.cwd(), 'migrations/001_mvp.sql'), 'utf8');
+  const tableDdls = [...sql.matchAll(/CREATE TABLE [a-z_]+ \(([\s\S]*?)\)'/gi)].map((match) => match[1]!);
+  for (const ddl of tableDdls) {
+    const timezoneColumns = [...ddl.matchAll(/^\s*([a-z_]+) TIMESTAMP(?:\(\d+\))? WITH TIME ZONE\b/gim)].map((match) => match[1]);
+    for (const timezoneColumn of timezoneColumns) {
+      assert.doesNotMatch(ddl, new RegExp(`(?:PRIMARY KEY|UNIQUE) \\([^)]*\\b${timezoneColumn}\\b`, 'i'));
+    }
+  }
+});
+
+test('reminder occurrence binding uses epoch milliseconds for a timezone-independent instant key', async () => {
+  const source = await readFile(resolve(process.cwd(), 'src/store/oracleApp.ts'), 'utf8');
+  assert.match(source, /due_at_epoch: row\.NEXT_DUE_AT\.getTime\(\)/);
+
+  const sameInstantUtc = new Date('2026-11-01T05:30:00.123Z');
+  const sameInstantOffset = new Date('2026-11-01T01:30:00.123-04:00');
+  const dstFoldLater = new Date('2026-11-01T01:30:00.123-05:00');
+  assert.equal(sameInstantUtc.getTime(), sameInstantOffset.getTime(), 'equal instants must deduplicate across offsets');
+  assert.notEqual(sameInstantUtc.getTime(), dstFoldLater.getTime(), 'DST-fold instants must remain distinct');
+  assert.equal(sameInstantUtc.getTime() % 1000, 123, 'millisecond precision must be retained');
+});
+
+test('schema inspection is an explicit read-only .env command', async () => {
+  const packageJson = JSON.parse(await readFile(resolve(process.cwd(), 'package.json'), 'utf8')) as { scripts: Record<string, string> };
+  const source = await readFile(resolve(process.cwd(), 'src/runtime/inspect-schema.ts'), 'utf8');
+  assert.equal(packageJson.scripts['inspect:schema'], 'node --env-file=.env --import tsx src/runtime/inspect-schema.ts');
+  assert.match(source, /FROM user_tab_columns/);
+  assert.match(source, /FROM user_constraints/);
+  assert.doesNotMatch(source, /\b(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|MERGE)\b/);
 });
 
 /**

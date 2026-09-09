@@ -55,10 +55,12 @@ export function splitSqlScript(script: string): string[] {
   // PL/SQL block tracking. `inPlSqlUnit` is set once the current top-level statement is
   // recognized (at its very start) as a DECLARE/BEGIN anonymous block; `depth` counts nested
   // BEGIN..END pairs (IF/LOOP/CASE END variants excluded); `sawBegin` distinguishes the
-  // declare-section (no top-level BEGIN yet) from the executable section.
+  // declare-section (no top-level BEGIN yet) from the executable section. A declared nested
+  // procedure/function has its own BEGIN..END before the anonymous block's top-level BEGIN.
   let inPlSqlUnit = false;
   let depth = 0;
   let sawBegin = false;
+  let inDeclaredSubprogram = false;
 
   const flush = () => {
     const trimmed = out.trim();
@@ -66,6 +68,7 @@ export function splitSqlScript(script: string): string[] {
     inPlSqlUnit = false;
     depth = 0;
     sawBegin = false;
+    inDeclaredSubprogram = false;
     if (!trimmed) return;
     if (/^\/$/.test(trimmed)) return; // SQLcl/SQL*Plus batch terminator, not SQL
     if (/^SET\s+\S/i.test(trimmed)) return; // SQLcl/SQL*Plus session command, not SQL
@@ -148,13 +151,16 @@ export function splitSqlScript(script: string): string[] {
     }
 
     if (inPlSqlUnit) {
-      if (matchesKeywordAt(script, i, 'BEGIN')) {
+      if (!sawBegin && (matchesKeywordAt(script, i, 'PROCEDURE') || matchesKeywordAt(script, i, 'FUNCTION'))) {
+        inDeclaredSubprogram = true;
+      } else if (matchesKeywordAt(script, i, 'BEGIN')) {
         depth += 1;
-        sawBegin = true;
+        if (!inDeclaredSubprogram) sawBegin = true;
       } else if (matchesKeywordAt(script, i, 'END')) {
         const nextWord = nextWordAfter(script, i + 3);
         if (nextWord !== 'IF' && nextWord !== 'LOOP' && nextWord !== 'CASE') {
           depth -= 1;
+          if (!sawBegin && depth <= 0) inDeclaredSubprogram = false;
         }
       }
     }

@@ -28,10 +28,12 @@ already used by an existing object"):
 
 - If the existing object is not visible in `USER_OBJECTS`, is the wrong object type (e.g. a view
   where a table is expected), or - for tables - has a different column count than expected, the
-  block raises a clear `ORA-20001`..`ORA-20005` error and the whole script stops. It never drops,
+  block raises a clear error and the whole script stops. `reminder_occurrences` and `check_runs`
+  additionally verify their affected timestamp types and UTC-epoch unique-key columns. It never drops,
   recreates, or truncates anything, and it never proceeds past an incompatible object.
-- Any error other than `ORA-00955` (permissions, syntax, a missing FK target, etc.) is always
-  re-raised immediately; it is never swallowed.
+- Any error other than `ORA-00955` (permissions, syntax, a missing FK target, etc.) is re-raised
+  immediately with the migration object name. Its Oracle code/message remains in the error stack;
+  it is never swallowed.
 - If the existing object passes those checks, it is treated as already applied and the script
   continues with the next object. This lets the script resume a migration that was interrupted
   partway through (Oracle DDL statements each commit implicitly, so a prior failed run can leave
@@ -41,11 +43,12 @@ already used by an existing object"):
   duplicate-key error on a second run).
 
 **This is a targeted compatibility check, not a full schema/DDL diff.** It compares object type and
-(for tables) column count only - it does not compare column types, defaults, `CHECK`/`FOREIGN KEY`
-constraints, or index key columns. An existing table with the right number of columns but a
-different type or constraint is accepted as "compatible" and will not be flagged. If you suspect
-schema drift, inspect the object manually (e.g. `DBMS_METADATA.GET_DDL`) before relying on a rerun.
-The decision rules are documented and unit-tested in `src/runtime/migration/compatibility.ts`.
+(for tables) column count only, except that `reminder_occurrences` and `check_runs` additionally
+verify their `TIMESTAMP(3) WITH TIME ZONE` columns, `NUMBER(19)` UTC-epoch columns, and unique-key
+column order. It does not compare other column types, defaults, `CHECK`/`FOREIGN KEY` constraints,
+or index key columns. If you suspect schema drift, inspect the object manually before relying on a
+rerun. The general decision rules are documented and unit-tested in
+`src/runtime/migration/compatibility.ts`.
 
 **Rerunning is not a rollback mechanism.** There is no down migration, and idempotent DDL does not
 undo or repair data. If a table already exists with an incompatible definition, fix it manually
@@ -59,12 +62,35 @@ Run migrations from one operator/session at a time.
 
 ## Editing an already-applied migration file
 
-`001_mvp.sql` has not yet been executed against any Oracle service (see the root `README.md`), so
-revising it here is a pre-deployment fix, not a rewrite of live schema history. Once a migration has
-actually been applied anywhere, prefer a new forward migration file (`002_*.sql`, etc.) over editing
-an existing one; if you manually applied an earlier version of this file's original (non-idempotent)
-DDL to a database, the current idempotent version is designed to recognize the same tables it would
-have created (same names, same column counts) and skip past them without touching your data.
+The original `001_mvp.sql` can fail partway through because Oracle prohibits a `TIMESTAMP WITH TIME
+ZONE` column in a primary or unique key (ORA-02329). The corrected first-install path retains
+`due_at`/`slot_at` as `TIMESTAMP(3) WITH TIME ZONE` for absolute-instant reads, and deduplicates
+with separately bound `NUMBER(19)` UTC epoch milliseconds. Equal instants with different offsets
+therefore share a key; the two local times in a DST fold do not. Local IANA recurrence data remains
+in `local_schedule_json` and is not converted by the database.
+
+If a prior `001` run stopped before its ledger row was written, rerun this corrected `001` from one
+session: it recognizes the preceding compatible tables and continues without dropping, truncating,
+or recreating data. Do not add `002` to repair this particular midway failure—the runner will not
+reach it until `001` completes. If version 1 is already recorded, use a separately reviewed forward
+migration for any schema correction; this file is intentionally skipped by the CLI in that state.
+
+Before rerunning, inspect only the relevant existing schema (the command reads Oracle dictionary
+views and never performs DDL/DML):
+
+```sh
+npm run inspect:schema
+```
+
+It loads the local ignored `.env` and prints no credential values. Verify that an existing affected
+table has the timestamp/epoch columns and unique-key order described above; an incompatible object
+will fail the corrected `001` rather than being changed automatically. Keep the output private if
+your object names are sensitive.
+
+The automated tests parse the real migration text and test JavaScript instant-key semantics, but
+fake tests cannot prove Oracle engine DDL acceptance. An optional live regression must be run
+manually against an already authorized, disposable development schema only; it is not run by this
+repository's test command and this project does not provision or alter a database automatically.
 
 The scheduler claim transaction should select due `jobs` using
 `FOR UPDATE SKIP LOCKED`, increment `fence`, set a bounded `lease_until`, and commit before processing.

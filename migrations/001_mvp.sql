@@ -34,6 +34,59 @@ DECLARE
   v_object_type USER_OBJECTS.OBJECT_TYPE%TYPE;
   v_count PLS_INTEGER;
   v_table_name VARCHAR2(30);
+
+  PROCEDURE verify_epoch_deduplication(
+    p_table_name VARCHAR2,
+    p_timestamp_column VARCHAR2,
+    p_epoch_column VARCHAR2,
+    p_entity_column VARCHAR2,
+    p_version_column VARCHAR2
+  ) IS
+    v_matching_columns PLS_INTEGER;
+    v_matching_constraint PLS_INTEGER;
+  BEGIN
+    SELECT COUNT(*) INTO v_matching_columns
+      FROM user_tab_columns
+     WHERE table_name = p_table_name
+       AND ((column_name = p_timestamp_column
+             AND data_type = 'TIMESTAMP WITH TIME ZONE'
+             AND data_scale = 3)
+         OR (column_name = p_epoch_column
+             AND data_type = 'NUMBER'
+             AND data_precision = 19
+             AND data_scale = 0));
+    IF v_matching_columns != 2 THEN
+      RAISE_APPLICATION_ERROR(-20006,
+        'Migration 001: table ' || p_table_name || ' must retain ' || p_timestamp_column ||
+        ' as TIMESTAMP(3) WITH TIME ZONE and use ' || p_epoch_column ||
+        ' as NUMBER(19) for UTC-instant deduplication.');
+    END IF;
+
+    SELECT COUNT(*) INTO v_matching_constraint
+      FROM user_constraints c
+     WHERE c.table_name = p_table_name
+       AND c.constraint_type = 'U'
+       AND (SELECT COUNT(*) FROM user_cons_columns cc
+             WHERE cc.constraint_name = c.constraint_name) = 4
+       AND EXISTS (SELECT 1 FROM user_cons_columns cc
+                    WHERE cc.constraint_name = c.constraint_name
+                      AND cc.position = 1 AND cc.column_name = 'WORKSPACE_ID')
+       AND EXISTS (SELECT 1 FROM user_cons_columns cc
+                    WHERE cc.constraint_name = c.constraint_name
+                      AND cc.position = 2 AND cc.column_name = p_entity_column)
+       AND EXISTS (SELECT 1 FROM user_cons_columns cc
+                    WHERE cc.constraint_name = c.constraint_name
+                      AND cc.position = 3 AND cc.column_name = p_version_column)
+       AND EXISTS (SELECT 1 FROM user_cons_columns cc
+                    WHERE cc.constraint_name = c.constraint_name
+                      AND cc.position = 4 AND cc.column_name = p_epoch_column);
+    IF v_matching_constraint != 1 THEN
+      RAISE_APPLICATION_ERROR(-20007,
+        'Migration 001: table ' || p_table_name || ' must have exactly one UTC-epoch deduplication ' ||
+        'key on (workspace_id, ' || LOWER(p_entity_column) || ', ' || LOWER(p_version_column) ||
+        ', ' || LOWER(p_epoch_column) || ').');
+    END IF;
+  END;
 BEGIN
   v_n := v_n + 1;
   v_name(v_n) := 'SCHEMA_MIGRATIONS';
@@ -156,16 +209,17 @@ BEGIN
   v_n := v_n + 1;
   v_name(v_n) := 'REMINDER_OCCURRENCES';
   v_kind(v_n) := 'TABLE';
-  v_cols(v_n) := 6;
+  v_cols(v_n) := 7;
   v_ddl(v_n) := 'CREATE TABLE reminder_occurrences (
   workspace_id VARCHAR2(36) NOT NULL,
   occurrence_id VARCHAR2(36) NOT NULL,
   reminder_id VARCHAR2(36) NOT NULL,
   schedule_version NUMBER(10) NOT NULL,
-  due_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  due_at TIMESTAMP(3) WITH TIME ZONE NOT NULL,
+  due_at_epoch NUMBER(19) NOT NULL,
   disposition VARCHAR2(16) DEFAULT ''scheduled'' NOT NULL,
   PRIMARY KEY (workspace_id, occurrence_id),
-  UNIQUE (workspace_id, reminder_id, schedule_version, due_at),
+  UNIQUE (workspace_id, reminder_id, schedule_version, due_at_epoch),
   FOREIGN KEY (workspace_id, reminder_id) REFERENCES reminders(workspace_id, reminder_id)
 )';
   v_n := v_n + 1;
@@ -248,17 +302,18 @@ BEGIN
   v_n := v_n + 1;
   v_name(v_n) := 'CHECK_RUNS';
   v_kind(v_n) := 'TABLE';
-  v_cols(v_n) := 7;
+  v_cols(v_n) := 8;
   v_ddl(v_n) := 'CREATE TABLE check_runs (
   workspace_id VARCHAR2(36) NOT NULL,
   check_id VARCHAR2(36) NOT NULL,
   monitor_id VARCHAR2(36) NOT NULL,
   config_version NUMBER(10) NOT NULL,
-  slot_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  slot_at TIMESTAMP(3) WITH TIME ZONE NOT NULL,
+  slot_at_epoch NUMBER(19) NOT NULL,
   outcome VARCHAR2(32) NOT NULL,
   completed_at TIMESTAMP WITH TIME ZONE,
   PRIMARY KEY (workspace_id, check_id),
-  UNIQUE (workspace_id, monitor_id, config_version, slot_at),
+  UNIQUE (workspace_id, monitor_id, config_version, slot_at_epoch),
   FOREIGN KEY (workspace_id, monitor_id) REFERENCES monitors(workspace_id, monitor_id)
 )';
   v_n := v_n + 1;
@@ -376,9 +431,10 @@ BEGIN
       WHEN OTHERS THEN
         -- Only ORA-00955 (name already used by an existing object) is a candidate for
         -- "already applied"; every other error (permissions, syntax, FK target missing, ...)
-        -- must propagate unchanged so the migration fails fast and loudly.
+        -- is re-raised with the object name while preserving Oracle's original error on the stack.
         IF SQLCODE != -955 THEN
-          RAISE;
+          RAISE_APPLICATION_ERROR(-20008,
+            'Migration 001: failed creating ' || v_name(i) || ': ' || SQLERRM, TRUE);
         END IF;
 
         BEGIN
@@ -408,6 +464,13 @@ BEGIN
               'manually (see migrations/README.md) before rerunning.');
           END IF;
           -- Column count matches: treat the existing table as already applied and continue.
+          IF v_name(i) = 'REMINDER_OCCURRENCES' THEN
+            verify_epoch_deduplication(
+              'REMINDER_OCCURRENCES', 'DUE_AT', 'DUE_AT_EPOCH', 'REMINDER_ID', 'SCHEDULE_VERSION');
+          ELSIF v_name(i) = 'CHECK_RUNS' THEN
+            verify_epoch_deduplication(
+              'CHECK_RUNS', 'SLOT_AT', 'SLOT_AT_EPOCH', 'MONITOR_ID', 'CONFIG_VERSION');
+          END IF;
         ELSE
           v_table_name := SUBSTR(v_kind(i), INSTR(v_kind(i), ':') + 1);
           IF v_object_type != 'INDEX' THEN
