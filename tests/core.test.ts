@@ -39,6 +39,10 @@ test('nonexistent local time advances to first valid instant and supports non-ho
     resolveLocalInstant('Australia/Lord_Howe', { year: 2026, month: 10, day: 4, hour: 2, minute: 15 }).toISOString(),
     '2026-10-03T15:30:00.000Z'
   );
+  assert.equal(
+    resolveLocalInstant('Pacific/Apia', { year: 2011, month: 12, day: 30, hour: 9, minute: 0 }).toISOString(),
+    '2011-12-30T10:00:00.000Z'
+  );
 });
 
 test('monthly dates skip absent months and elapsed recurrence is duration based', () => {
@@ -58,6 +62,14 @@ test('monthly dates skip absent months and elapsed recurrence is duration based'
     2
   );
   assert.deepEqual(elapsed.map((date) => date.toISOString()), ['2026-01-03T00:00:00.000Z', '2026-01-04T00:00:00.000Z']);
+  assert.equal(
+    nextOccurrences(
+      { kind: 'elapsed', zone: 'UTC', startAt: '2026-01-02T00:00:00Z', intervalMinutes: 60 },
+      new Date('2026-01-01T00:00:00Z'),
+      1
+    )[0]?.toISOString(),
+    '2026-01-02T00:00:00.000Z'
+  );
   assert.equal(classifyBacklog(new Date('2026-01-01T00:00:00Z'), new Date('2026-01-02T00:00:00Z')), 'missed');
 });
 
@@ -81,7 +93,8 @@ test('pull thresholds, recovery, pause, maintenance, and platform outage are ind
   state = observePull(state, 'success', '2026-01-01T00:04:00Z');
   assert.equal(state.state, 'healthy');
   assert.equal(observePull({ ...state, coverageAvailable: false }, 'target-failure', 'x').state, 'unknown');
-  assert.equal(observePull({ ...state, inMaintenance: true }, 'target-failure', 'x').state, 'healthy');
+  assert.equal(observePull({ ...state, inMaintenance: true }, 'target-failure', 'x').state, 'failing');
+  assert.equal(evaluatePush({ ...initial, inMaintenance: true }, 421_000, 0, 300_000, 120_000).state, 'down');
   assert.equal(resumeCycle({ ...state, paused: true }).state, 'unknown');
 });
 
@@ -118,7 +131,7 @@ test('probe validation rejects internal targets and resolutions', () => {
   ]) assert.throws(() => validateProbeUrl(target));
   assert.throws(() => validateProbeUrl('https://api.example.com', ['example.com']));
   assert.doesNotThrow(() => assertPublicAddresses(['8.8.8.8', '2606:4700:4700::1111']));
-  for (const address of ['127.0.0.1', '10.0.0.1', '169.254.169.254', '::1', 'fd00::1', '2001:db8::1']) {
+  for (const address of ['127.0.0.1', '10.0.0.1', '169.254.169.254', '::1', 'fd00::1', '2001:db8::1', '2001:db8::2', '2002:0808:0808::']) {
     assert.throws(() => assertPublicAddresses([address]));
   }
 });
@@ -205,6 +218,8 @@ test('role configuration keeps probe credentials absent and outbound execution f
     probeExecutionEnabled: false
   });
   assert.throws(() => loadConfig({ PROCESS_ROLE: 'probe', ORACLE_PASSWORD: 'secret' }));
+  assert.throws(() => loadConfig({ PROCESS_ROLE: 'probe', ORACLE_USER: 'metadata-only' }));
+  assert.throws(() => loadConfig({ PROCESS_ROLE: 'probe', GMAIL_USER: 'metadata-only' }));
   assert.throws(() => loadConfig({ PROCESS_ROLE: 'probe', PROBE_EXECUTION_ENABLED: 'true' }), /fail-closed/);
   assert.throws(() => loadConfig({ PROCESS_ROLE: 'api' }), /HTTPS/);
 });

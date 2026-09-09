@@ -1,5 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
+import ipaddr from 'ipaddr.js';
 
 export function generateHeartbeatCredential(): { token: string; hash: string } {
   const token = randomBytes(32).toString('base64url');
@@ -45,35 +46,12 @@ export function validateProbeUrl(raw: string, deniedHosts: readonly string[] = [
   return url;
 }
 
-function publicIpv4(address: string): boolean {
-  const values = address.split('.').map(Number);
-  if (values.length !== 4 || values.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return false;
-  const [a = 0, b = 0, c = 0] = values;
-  return !(
-    a === 0 || a === 10 || a === 127 || a >= 224 ||
-    (a === 100 && b >= 64 && b <= 127) ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 0) ||
-    (a === 192 && b === 168) ||
-    (a === 198 && (b === 18 || b === 19)) ||
-    (a === 198 && b === 51 && c === 100) ||
-    (a === 203 && b === 0 && c === 113)
-  );
-}
-
 export function assertPublicAddresses(addresses: readonly string[]): void {
   if (addresses.length === 0) throw new RangeError('Target hostname did not resolve');
   for (const address of addresses) {
-    const version = isIP(address);
-    const normalized = address.toLowerCase();
-    if (version === 4 && publicIpv4(address)) continue;
-    if (
-      version === 6 &&
-      /^(2|3)[0-9a-f]{3}:/.test(normalized) &&
-      !normalized.includes('::ffff:') &&
-      normalized !== '2001:db8::1'
-    ) continue;
+    if (!ipaddr.isValid(address)) throw new RangeError('Every resolved address must be a valid IP address');
+    const parsed = ipaddr.parse(address);
+    if (parsed.range() === 'unicast') continue;
     throw new RangeError('Every resolved address must be public global unicast');
   }
 }

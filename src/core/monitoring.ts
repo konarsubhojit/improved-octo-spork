@@ -7,8 +7,6 @@ export function observePull(snapshot: MonitorSnapshot, evidence: Evidence, at: s
   if (!snapshot.coverageAvailable || evidence === 'infrastructure-failure') {
     return { ...snapshot, state: 'unknown' };
   }
-  if (snapshot.inMaintenance) return { ...snapshot, lastEvidenceAt: at };
-
   if (evidence === 'target-failure') {
     const failures = snapshot.consecutiveFailures + 1;
     return {
@@ -37,7 +35,7 @@ export function evaluatePush(
   graceMs: number
 ): MonitorSnapshot {
   if (snapshot.paused) return { ...snapshot, state: 'paused' };
-  if (!snapshot.coverageAvailable || snapshot.inMaintenance || lastReceiptMs === undefined) {
+  if (!snapshot.coverageAvailable || lastReceiptMs === undefined) {
     return { ...snapshot, state: 'unknown' };
   }
   const age = nowMs - lastReceiptMs;

@@ -43,7 +43,10 @@ export function loadConfig(env: NodeJS.ProcessEnv): RuntimeConfig {
     if (!env.GMAIL_USER || !env.GMAIL_APP_PASSWORD) throw new Error('email-worker requires Gmail app-password credentials');
     config.gmail = { user: env.GMAIL_USER, appPassword: env.GMAIL_APP_PASSWORD };
   }
-  if (role === 'probe' && (env.ORACLE_PASSWORD || env.GMAIL_APP_PASSWORD)) {
+  if (
+    role === 'probe' &&
+    [env.ORACLE_USER, env.ORACLE_PASSWORD, env.ORACLE_CONNECT_STRING, env.GMAIL_USER, env.GMAIL_APP_PASSWORD].some(Boolean)
+  ) {
     throw new Error('probe role must not receive database or email credentials');
   }
   if (role === 'probe' && config.probeExecutionEnabled) {

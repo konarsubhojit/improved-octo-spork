@@ -52,8 +52,8 @@ export class OracleHeartbeatStore implements HeartbeatStore {
           return { accepted: true, duplicate: true };
         }
       }
-      const monitor = await connection.execute<{ DEADLINE_VERSION: number }>(
-        `SELECT deadline_version FROM monitors
+      const monitor = await connection.execute<{ DEADLINE_VERSION: number; LAST_EVIDENCE_AT: Date | null }>(
+        `SELECT deadline_version, last_evidence_at FROM monitors
           WHERE workspace_id = :workspace_id AND monitor_id = :monitor_id
             AND mode = 'push' AND paused_at IS NULL AND deleted_at IS NULL
           FOR UPDATE`,
@@ -65,6 +65,8 @@ export class OracleHeartbeatStore implements HeartbeatStore {
         await connection.rollback();
         return { accepted: false, duplicate: false };
       }
+      const isNewest = !current.LAST_EVIDENCE_AT || submission.receivedAt > current.LAST_EVIDENCE_AT;
+      const deadlineVersion = current.DEADLINE_VERSION + (isNewest ? 1 : 0);
       await connection.execute(
         `INSERT INTO heartbeat_receipts(
            workspace_id, monitor_id, receipt_id, event_id, received_at, deadline_version
@@ -76,22 +78,24 @@ export class OracleHeartbeatStore implements HeartbeatStore {
           monitor_id: row.MONITOR_ID,
           event_id: submission.eventId ?? null,
           received_at: submission.receivedAt,
-          deadline_version: current.DEADLINE_VERSION + 1
+          deadline_version: deadlineVersion
         }
       );
-      await connection.execute(
-        `UPDATE monitors
-            SET last_evidence_at = :received_at, state = 'healthy',
-                deadline_version = deadline_version + 1
-          WHERE workspace_id = :workspace_id AND monitor_id = :monitor_id
-            AND deadline_version = :deadline_version`,
-        {
-          received_at: submission.receivedAt,
-          workspace_id: row.WORKSPACE_ID,
-          monitor_id: row.MONITOR_ID,
-          deadline_version: current.DEADLINE_VERSION
-        }
-      );
+      if (isNewest) {
+        await connection.execute(
+          `UPDATE monitors
+              SET last_evidence_at = :received_at, state = 'healthy',
+                  deadline_version = deadline_version + 1
+            WHERE workspace_id = :workspace_id AND monitor_id = :monitor_id
+              AND deadline_version = :deadline_version`,
+          {
+            received_at: submission.receivedAt,
+            workspace_id: row.WORKSPACE_ID,
+            monitor_id: row.MONITOR_ID,
+            deadline_version: current.DEADLINE_VERSION
+          }
+        );
+      }
       await connection.commit();
       return { accepted: true, duplicate: false };
     } catch (error) {

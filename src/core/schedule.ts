@@ -48,17 +48,14 @@ export function resolveLocalInstant(zone: string, value: LocalDateTime): Date {
   formatter(zone);
   const approximate = key(value);
   let firstAfter: number | undefined;
-  for (let candidate = approximate - 36 * 60 * 60_000; candidate <= approximate + 36 * 60 * 60_000; candidate += 60_000) {
+  let firstAfterKey: number | undefined;
+  for (let candidate = approximate - 48 * 60 * 60_000; candidate <= approximate + 72 * 60 * 60_000; candidate += 60_000) {
     const local = localAt(candidate, zone);
-    if (key(local) === approximate) return new Date(candidate);
-    if (
-      local.year === value.year &&
-      local.month === value.month &&
-      local.day === value.day &&
-      key(local) > approximate &&
-      (firstAfter === undefined || candidate < firstAfter)
-    ) {
+    const localKey = key(local);
+    if (localKey === approximate) return new Date(candidate);
+    if (localKey > approximate && (firstAfterKey === undefined || localKey < firstAfterKey || (localKey === firstAfterKey && candidate < firstAfter!))) {
       firstAfter = candidate;
+      firstAfterKey = localKey;
     }
   }
   if (firstAfter !== undefined) return new Date(firstAfter);
@@ -94,7 +91,7 @@ export function nextOccurrences(schedule: ReminderSchedule, after: Date, count =
       throw new RangeError('elapsed schedules require startAt and a positive intervalMinutes');
     }
     const intervalMs = interval * 60_000;
-    const step = Math.max(1, Math.floor((after.getTime() - start.getTime()) / intervalMs) + 1);
+    const step = Math.max(0, Math.floor((after.getTime() - start.getTime()) / intervalMs) + 1);
     return Array.from({ length: count }, (_, index) => new Date(start.getTime() + (step + index) * intervalMs));
   }
 
