@@ -1,16 +1,31 @@
 {
-  "name": "trial-expiry-reminder",
-  "version": "1.0.0",
-  "description": "Zero-cost serverless trial expiry reminder app (AWS SAM + Lambda + DynamoDB + Gmail SMTP)",
+  "name": "reminders-service-monitor",
+  "version": "0.2.0",
+  "description": "Invite-only reminders and two-way service monitoring MVP",
   "type": "module",
   "license": "MIT",
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "build": "tsc --noEmit && vite build",
+    "test": "tsx --test tests/*.test.ts tests/*.test.mjs",
+    "test:core": "tsx --test tests/core.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1121.0",
     "@aws-sdk/lib-dynamodb": "^3.1121.0",
-    "nodemailer": "^9.0.6",
+    "nodemailer": "^10.0.1",
+    "oracledb": "^7.0.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "uuid": "^14.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.5.0",
+    "@types/oracledb": "^7.0.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
   }
 }
