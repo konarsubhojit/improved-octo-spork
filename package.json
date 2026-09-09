@@ -8,7 +8,12 @@
     "build": "tsc --noEmit && vite build",
     "test": "tsx --test tests/*.test.ts tests/*.test.mjs",
     "test:core": "tsx --test tests/core.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "start:api": "tsx src/runtime/api.ts",
+    "start:scheduler": "tsx src/runtime/scheduler.ts",
+    "start:email-worker": "tsx src/runtime/email-worker.ts",
+    "migrate": "tsx src/runtime/migrate.ts",
+    "bootstrap": "tsx src/runtime/bootstrap.ts"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1121.0",

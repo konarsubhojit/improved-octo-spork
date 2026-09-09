@@ -17,10 +17,10 @@ The MVP foundation includes:
 
 ## Current implementation boundary
 
-This is intentionally a secure foundation rather than a claim that the entire production system is
-finished. The push heartbeat service and Oracle adapter are implemented. Core policies are
-unit-tested. Owner API routing, bootstrap CLI, scheduler/email-worker loops, and target authorization
-workers remain contract-only. **Outbound pull execution is fail-closed**, because this repository
+This remains an incremental MVP. A runnable vertical slice now exists for invite verification +
+authenticated reminder creation/listing + Oracle-backed scheduler and email-worker loops. Push
+heartbeat ingress and Oracle receipt persistence are also implemented. **Outbound pull execution is
+fail-closed**, because this repository
 does not yet demonstrate the required DNS pinning, TLS/SNI validation, redirect/header/body/time
 bounds, process isolation, and independent egress containment. Do not enable it by substituting a
 normal `fetch`.
@@ -68,6 +68,13 @@ npm run typecheck
 npm run test:core
 npm test
 npm run build
+# Manual role entrypoints (local only, no deployment from this repo):
+PROCESS_ROLE=api npm exec tsx src/runtime/api.ts
+PROCESS_ROLE=scheduler npm exec tsx src/runtime/scheduler.ts
+PROCESS_ROLE=email-worker npm exec tsx src/runtime/email-worker.ts
+# Manual migration/bootstrap helpers:
+PROCESS_ROLE=scheduler npm exec tsx src/runtime/migrate.ts
+PROCESS_ROLE=scheduler npm exec tsx src/runtime/bootstrap.ts <workspace-id> <workspace-name> <invite-email>
 ```
 
 Tests use no credentials, SMTP, Oracle, DNS, HTTP targets, or cloud resources. The React build emits
@@ -86,8 +93,8 @@ must never appear in application logs, traces, error reports, analytics, or UI h
   exact existing service first.
 - [`docs/openapi.yaml`](docs/openapi.yaml) documents reminder CRUD/preview/pause/resume,
   subscriptions, services/monitors, authorization, rotation, test checks, maintenance, incidents,
-  notification history, authentication, and ingestion. Its implementation-status extension clearly
-  separates working code from contract-only routes.
+  notification history, authentication, and ingestion. Current implementation covers invite verify,
+  sign-out, reminders list/create/preview, dashboard, scheduler, and email-worker vertical slice.
 
 All owned rows carry `workspace_id`; composite foreign keys prevent cross-workspace references.
 Every runtime query must be workspace-scoped and parameter-bound. Optimistic edit and schedule/config
@@ -118,6 +125,6 @@ days for raw observations, 90 days for incidents/notifications, and 180 days for
 Deletion revokes tokens and queued work immediately; target live-data purge is within 30 days.
 Backups, disaster recovery, RPO/RTO, and tested restore are explicitly deferred.
 
-No Oracle/live network integration, SMTP, load, failover, or deployment validation has been
-performed. Do not merge or deploy until those prerequisites and remaining contract-only features
-are reviewed and completed.
+No live Oracle migration execution, live SMTP delivery, network probing, load, failover, or
+deployment validation has been performed in this task. Do not merge or deploy until those
+prerequisites and the remaining contract-only endpoints are reviewed and completed.

@@ -18,27 +18,65 @@ function Badge({ value }: { value: string | undefined }) {
 function App() {
   const [data, setData] = useState<Dashboard>();
   const [error, setError] = useState('');
-  useEffect(() => {
+  const [inviteToken, setInviteToken] = useState('');
+  const [csrfToken, setCsrfToken] = useState('');
+
+  const loadDashboard = () =>
     fetch('/api/dashboard', { credentials: 'same-origin', headers: { Accept: 'application/json' } })
       .then(async (response) => {
-        if (response.status === 401) throw new Error('Sign in with a verified invited email to view this workspace.');
+        if (response.status === 401) throw new Error('Sign in with your invite token to view this workspace.');
         if (!response.ok) throw new Error('Dashboard data is temporarily unavailable.');
         return response.json() as Promise<Dashboard>;
       })
       .then(setData)
       .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Unable to load dashboard.'));
+
+  useEffect(() => {
+    void loadDashboard();
   }, []);
+
+  const verifyInvite = async () => {
+    setError('');
+    const response = await fetch('/api/auth/verify', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: inviteToken })
+    });
+    if (!response.ok) {
+      setError('Invite token is invalid or expired.');
+      return;
+    }
+    const payload = response.status === 204 ? await response.json().catch(() => ({ csrfToken: '' })) : await response.json();
+    setCsrfToken(payload.csrfToken ?? '');
+    await loadDashboard();
+  };
+
+  const signOut = async () => {
+    await fetch('/api/auth/signout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: csrfToken ? { 'X-CSRF-Token': csrfToken, Origin: window.location.origin } : { Origin: window.location.origin }
+    });
+    setData(undefined);
+    setCsrfToken('');
+  };
 
   return (
     <main>
       <header>
         <div><p className="eyebrow">Personal workspace</p><h1>Reminders & service health</h1></div>
-        <button type="button">Account & subscriptions</button>
+        <button type="button" onClick={() => void signOut()}>Sign out</button>
       </header>
       <aside>
         Calendar reminders preserve local wall time across DST. Missing monthly dates are skipped.
         Pull and push status are independent; one mode never clears the other.
       </aside>
+      {!data && <section className="notice">
+        <p>Sign in with an invite token.</p>
+        <input value={inviteToken} onChange={(event) => setInviteToken(event.target.value)} aria-label="Invite token" />
+        <button type="button" onClick={() => void verifyInvite()}>Verify invite</button>
+      </section>}
       {error && <section className="notice">{error}</section>}
       {!data && !error && <p>Loading…</p>}
       {data && <>
