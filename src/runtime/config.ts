@@ -6,7 +6,7 @@ export interface RuntimeConfig {
   trustedOrigin?: string;
   publicBaseUrl?: string;
   database?: { user: string; password: string; connectString: string };
-  gmail?: { user: string; appPassword: string };
+  gmail?: { user: string; appPassword: string; port: 465 | 587 };
   probeExecutionEnabled: boolean;
 }
 
@@ -41,7 +41,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): RuntimeConfig {
   }
   if (role === 'email-worker') {
     if (!env.GMAIL_USER || !env.GMAIL_APP_PASSWORD) throw new Error('email-worker requires Gmail app-password credentials');
-    config.gmail = { user: env.GMAIL_USER, appPassword: env.GMAIL_APP_PASSWORD };
+    const port = Number(env.GMAIL_PORT ?? 587);
+    if (port !== 465 && port !== 587) throw new Error('GMAIL_PORT must be 465 or 587');
+    config.gmail = { user: env.GMAIL_USER, appPassword: env.GMAIL_APP_PASSWORD, port };
   }
   if (
     role === 'probe' &&

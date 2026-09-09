@@ -13,7 +13,11 @@ paths:
   /api/auth/verify:
     post:
       summary: Consume a one-use email verification token and create a session
-      responses: { '204': { description: Verified }, '400': { $ref: '#/components/responses/Error' } }
+      responses: { '200': { description: Verified with CSRF token }, '400': { $ref: '#/components/responses/Error' } }
+  /api/auth/signout:
+    post:
+      summary: Revoke current session and clear cookie
+      responses: { '204': { description: Signed out }, '401': { $ref: '#/components/responses/Error' } }
   /api/invites:
     post:
       summary: Create an expiring invite (bootstrap CLI uses the same service, never a public admin route)
@@ -119,7 +123,9 @@ x-implementation-status:
     - session/invite/CSRF primitives
     - push heartbeat service and Oracle atomic receipt adapter
     - leases, fencing, dispatch suppression, retry, and quota primitives
+    - authenticated invite verification/session, reminder creation/list/preview, and workspace dashboard routes
+    - scheduler and email-worker process loops with Oracle-backed reminder/notification persistence
   disabled-or-contract-only:
-    - owner API routing
     - outbound pull execution
-    - scheduler and SMTP worker process loops
+    - monitor authorization/rotation/test endpoints
+    - full owner API surface outside invite/auth/reminder/dashboard vertical slice
