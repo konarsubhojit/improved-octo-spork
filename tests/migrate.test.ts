@@ -6,7 +6,8 @@ import { splitSqlScript } from '../src/runtime/migration/sql-script.js';
 import { executeMigrationScript } from '../src/runtime/migration/run-script.js';
 import { parseMigrationFileNames, pendingMigrations } from '../src/runtime/migration/plan.js';
 import { runMigrations, type MigrationDeps } from '../src/runtime/migration/migrator.js';
-import { classifyExistingObject } from '../src/runtime/migration/compatibility.js';
+import { classifyExistingObject, classifyMonitorModeColumn, type MonitorModeState } from '../src/runtime/migration/compatibility.js';
+import { extractSqlLiteralsFromSource, findReservedIdentifiers } from '../src/runtime/migration/reserved-words.js';
 
 // --- sql-script.ts: splitSqlScript -----------------------------------------------------------
 
@@ -411,6 +412,192 @@ test('schema inspection is an explicit read-only .env command', async () => {
   assert.match(source, /FROM user_tab_columns/);
   assert.match(source, /FROM user_constraints/);
   assert.doesNotMatch(source, /\b(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|MERGE)\b/);
+});
+
+// --- reserved-words.ts: Oracle reserved identifiers -------------------------------------------
+
+test('findReservedIdentifiers reproduces the ORA-03050 failure for the historical monitors DDL', () => {
+  // Exactly the DDL that failed live with:
+  //   ORA-20008: Migration 001: failed creating MONITORS: ORA-03050: invalid identifier:
+  //   "MODE" is a reserved word
+  const historical = `CREATE TABLE monitors (
+  workspace_id VARCHAR2(36) NOT NULL,
+  monitor_id VARCHAR2(36) NOT NULL,
+  mode VARCHAR2(8) NOT NULL CHECK (mode IN ('pull', 'push')),
+  state VARCHAR2(16) DEFAULT 'unknown' NOT NULL
+)`;
+  const findings = findReservedIdentifiers(historical);
+  assert.ok(
+    findings.some((finding) => finding.identifier === 'MODE' && finding.context.includes('CREATE TABLE MONITORS')),
+    `expected the reserved column MODE to be reported, got ${JSON.stringify(findings)}`
+  );
+});
+
+test('findReservedIdentifiers flags reserved identifiers in DML and DDL but accepts quoted or renamed ones', () => {
+  assert.deepEqual(
+    findReservedIdentifiers(`SELECT deadline_version FROM monitors WHERE mode = 'push'`).map((f) => f.identifier),
+    ['MODE']
+  );
+  assert.deepEqual(
+    findReservedIdentifiers(`INSERT INTO monitors(workspace_id, mode) VALUES (:workspace_id, 'push')`).map((f) => f.identifier),
+    ['MODE']
+  );
+  assert.deepEqual(findReservedIdentifiers(`SELECT monitor_mode AS mode FROM monitors`).map((f) => f.identifier), ['MODE']);
+  // Quoting is the only legal way to keep a reserved word as an identifier; the migration uses it
+  // solely to rename the legacy column away.
+  assert.deepEqual(findReservedIdentifiers(`ALTER TABLE monitors RENAME COLUMN "MODE" TO monitor_mode`), []);
+  assert.deepEqual(findReservedIdentifiers(`SELECT deadline_version FROM monitors WHERE monitor_mode = 'push'`), []);
+  // Bind variables and pseudocolumns must not be misreported as identifiers.
+  assert.deepEqual(findReservedIdentifiers(`SELECT object_type FROM user_objects WHERE object_name = :mode AND ROWNUM = 1`), []);
+});
+
+test('no handwritten migration uses an Oracle reserved word as an unquoted identifier', async () => {
+  for (const file of ['migrations/001_mvp.sql', 'migrations/002_monitor_mode.sql']) {
+    const sql = await readFile(resolve(process.cwd(), file), 'utf8');
+    assert.deepEqual(findReservedIdentifiers(sql), [], `${file} must not declare/reference reserved identifiers unquoted`);
+  }
+});
+
+test('no runtime SQL uses an Oracle reserved word as an unquoted identifier', async () => {
+  const sources = ['src/store/oracle.ts', 'src/store/oracleApp.ts', 'src/runtime/migrate.ts', 'src/runtime/inspect-schema.ts'];
+  for (const file of sources) {
+    const statements = extractSqlLiteralsFromSource(await readFile(resolve(process.cwd(), file), 'utf8'));
+    assert.ok(statements.length > 0, `${file}: expected to find SQL statements to audit`);
+    for (const statement of statements) {
+      assert.deepEqual(findReservedIdentifiers(statement), [], `${file}: ${statement}`);
+    }
+  }
+});
+
+// --- monitors.monitor_mode: schema, transition rules and runtime mapping ----------------------
+
+test('migrations/001_mvp.sql declares monitor_mode with the pull/push contract and no MODE column', async () => {
+  const sql = await readFile(resolve(process.cwd(), 'migrations/001_mvp.sql'), 'utf8');
+  const monitors = sql.match(/CREATE TABLE monitors \(([\s\S]*?)\)'/i)?.[1] ?? '';
+  assert.match(monitors, /monitor_mode VARCHAR2\(8\) NOT NULL CHECK \(monitor_mode IN \(''pull'', ''push''\)\)/);
+  assert.doesNotMatch(monitors, /^\s*mode\b/im);
+  // The legacy column may only appear quoted, in the one-off rename.
+  assert.match(sql, /ALTER TABLE monitors RENAME COLUMN "MODE" TO monitor_mode/);
+});
+
+test('migrations/002_monitor_mode.sql is a parsable forward migration recorded as version 2', async () => {
+  const sql = await readFile(resolve(process.cwd(), 'migrations/002_monitor_mode.sql'), 'utf8');
+  const stmts = splitSqlScript(sql);
+  assert.equal(stmts.length, 2, 'expected one anonymous PL/SQL block and one trailing MERGE');
+  assert.match(stmts[0]!, /DECLARE[\s\S]*END;$/);
+  assert.ok(!stmts[0]!.includes('\n/'), 'the slash batch terminator must not be part of the statement');
+  assert.match(stmts[1]!, /MERGE INTO schema_migrations[\s\S]*SELECT 2 AS version[\s\S]*;$/);
+  // It must never repair schema by recreating or copying, and must not replay data migrations.
+  assert.doesNotMatch(stmts[0]!, /\b(DROP|TRUNCATE|CREATE TABLE|DELETE)\b/i);
+  assert.match(stmts[0]!, /RAISE_APPLICATION_ERROR/);
+});
+
+test('classifyMonitorModeColumn mirrors the PL/SQL transition rules for every column state', () => {
+  const valid = { dataType: 'VARCHAR2', charLength: 8, nullable: false };
+  const state = (overrides: Partial<MonitorModeState>): MonitorModeState => ({ hasPullPushCheck: true, ...overrides });
+
+  assert.deepEqual(classifyMonitorModeColumn(state({ current: valid })), { action: 'none' });
+  assert.deepEqual(classifyMonitorModeColumn(state({ legacy: valid })), { action: 'rename-legacy' });
+
+  const both = classifyMonitorModeColumn(state({ legacy: valid, current: valid }));
+  assert.equal(both.action, 'stop');
+  assert.match((both as { reason: string }).reason, /both the legacy "MODE" column and MONITOR_MODE/);
+
+  const neither = classifyMonitorModeColumn(state({}));
+  assert.equal(neither.action, 'stop');
+  assert.match((neither as { reason: string }).reason, /neither MONITOR_MODE nor a legacy "MODE" column/);
+
+  const wrongType = classifyMonitorModeColumn(state({ current: { dataType: 'NUMBER', charLength: 0, nullable: false } }));
+  assert.equal(wrongType.action, 'stop');
+  const nullable = classifyMonitorModeColumn(state({ current: { ...valid, nullable: true } }));
+  assert.equal(nullable.action, 'stop');
+  const wrongLength = classifyMonitorModeColumn(state({ legacy: { ...valid, charLength: 16 } }));
+  assert.equal(wrongLength.action, 'stop');
+
+  const missingCheck = classifyMonitorModeColumn({ current: valid, hasPullPushCheck: false });
+  assert.equal(missingCheck.action, 'stop');
+  assert.match((missingCheck as { reason: string }).reason, /CHECK constraint/);
+});
+
+test('the PL/SQL monitor-mode guard covers the same states as classifyMonitorModeColumn', async () => {
+  for (const file of ['migrations/001_mvp.sql', 'migrations/002_monitor_mode.sql']) {
+    const sql = await readFile(resolve(process.cwd(), file), 'utf8');
+    assert.match(sql, /v_legacy > 0 AND v_current > 0/, `${file}: both-column refusal`);
+    assert.match(sql, /v_legacy = 0 AND v_current = 0/, `${file}: neither-column refusal`);
+    assert.match(sql, /data_type = 'VARCHAR2'[\s\S]*char_length = 8[\s\S]*nullable = 'N'/, `${file}: type/nullability check`);
+    assert.match(sql, /search_condition_vc\) LIKE '%PULL%'/, `${file}: pull/push check constraint`);
+    assert.match(sql, /IF v_current = 0 THEN[\s\S]*RENAME COLUMN "MODE" TO monitor_mode/, `${file}: legacy rename`);
+  }
+});
+
+test('the fixed 001 and forward 002 apply in order for a fresh install and skip already-recorded versions', async () => {
+  const files = {
+    '001_mvp.sql': await readFile(resolve(process.cwd(), 'migrations/001_mvp.sql'), 'utf8'),
+    '002_monitor_mode.sql': await readFile(resolve(process.cwd(), 'migrations/002_monitor_mode.sql'), 'utf8')
+  };
+
+  const freshOrder: string[] = [];
+  await runMigrations(fakeDeps({ files, onApplied: (file) => freshOrder.push(file.name) }));
+  assert.deepEqual(freshOrder, ['001_mvp.sql', '002_monitor_mode.sql']);
+
+  // Legacy install: version 1 is already recorded, so only the forward migration may run - 001
+  // alone can never repair it, which is why 002 exists.
+  const legacyOrder: string[] = [];
+  await runMigrations(
+    fakeDeps({
+      files,
+      schemaMigrationsExists: async () => true,
+      listAppliedVersions: async () => [1],
+      onApplied: (file) => legacyOrder.push(file.name)
+    })
+  );
+  assert.deepEqual(legacyOrder, ['002_monitor_mode.sql']);
+
+  // Repeat run after both versions are recorded: no statement is executed at all, so no data can
+  // change and no historical migration is replayed.
+  const repeated: string[] = [];
+  await runMigrations(
+    fakeDeps({
+      files,
+      schemaMigrationsExists: async () => true,
+      listAppliedVersions: async () => [1, 2],
+      execute: async (statement) => {
+        repeated.push(statement);
+      }
+    })
+  );
+  assert.deepEqual(repeated, []);
+});
+
+test('a refused monitor-mode state stops before 002 is recorded as applied', async () => {
+  const files = {
+    '002_monitor_mode.sql': await readFile(resolve(process.cwd(), 'migrations/002_monitor_mode.sql'), 'utf8')
+  };
+  let commits = 0;
+  const executed: string[] = [];
+  await assert.rejects(
+    () =>
+      runMigrations(
+        fakeDeps({
+          files,
+          schemaMigrationsExists: async () => true,
+          listAppliedVersions: async () => [1],
+          execute: async (statement) => {
+            executed.push(statement);
+            throw Object.assign(
+              new Error('ORA-20009: Migration 002: table MONITORS has both the legacy "MODE" column and MONITOR_MODE.'),
+              { errorNum: 20009 }
+            );
+          },
+          commit: async () => {
+            commits += 1;
+          }
+        })
+      ),
+    /ORA-20009/
+  );
+  assert.equal(executed.length, 1, 'the failure must stop before the ledger MERGE');
+  assert.equal(commits, 0, 'a failed migration must never be recorded as applied');
 });
 
 /**
