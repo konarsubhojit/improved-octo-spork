@@ -3,11 +3,20 @@ import { createRoot } from 'react-dom/client';
 import './style.css';
 
 type Dashboard = {
-  reminders: Array<{ id: string; title: string; nextDueAt: string; state: string }>;
+  reminders: Array<{ id: string; title: string; nextDueAt: string; state: string; editVersion: number }>;
   services: Array<{ id: string; name: string; pullState?: string; pushState?: string }>;
   incidents: Array<{ id: string; service: string; mode: string; openedAt: string }>;
   notifications: Array<{ id: string; subject: string; state: string; updatedAt: string }>;
   quota: { rolling24h: number; rolling24hLimit: number; monthly: number; monthlyLimit: number };
+};
+
+type Recipient = {
+  recipientId: string;
+  email: string;
+  ownershipVerifiedAt: string | null;
+  consentedAt: string | null;
+  unsubscribedAt: string | null;
+  version: number;
 };
 
 function Badge({ value }: { value: string | undefined }) {
@@ -20,6 +29,7 @@ function App() {
   const [error, setError] = useState('');
   const [inviteToken, setInviteToken] = useState('');
   const [csrfToken, setCsrfToken] = useState('');
+  const [recipients, setRecipients] = useState<Recipient[]>([]);
 
   const loadDashboard = () =>
     fetch('/api/dashboard', { credentials: 'same-origin', headers: { Accept: 'application/json' } })
@@ -31,8 +41,17 @@ function App() {
       .then(setData)
       .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Unable to load dashboard.'));
 
+  const loadRecipients = () =>
+    fetch('/api/recipients', { credentials: 'same-origin', headers: { Accept: 'application/json' } })
+      .then(async (response) => {
+        if (!response.ok) throw new Error('Unable to load recipients.');
+        const payload = (await response.json()) as { recipients: Recipient[] };
+        setRecipients(payload.recipients);
+      })
+      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : 'Unable to load recipients.'));
+
   useEffect(() => {
-    void loadDashboard();
+    void loadDashboard().then(() => loadRecipients()).catch(() => undefined);
   }, []);
 
   const verifyInvite = async () => {
@@ -50,6 +69,7 @@ function App() {
     const payload = response.status === 204 ? await response.json().catch(() => ({ csrfToken: '' })) : await response.json();
     setCsrfToken(payload.csrfToken ?? '');
     await loadDashboard();
+    await loadRecipients();
   };
 
   const signOut = async () => {
@@ -60,6 +80,59 @@ function App() {
     });
     setData(undefined);
     setCsrfToken('');
+    setRecipients([]);
+  };
+
+  const patchReminder = async (reminderId: string, expectedEditVersion: number, action: 'pause' | 'resume') => {
+    setError('');
+    const response = await fetch(`/api/reminders/${reminderId}`, {
+      method: 'PATCH',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': csrfToken,
+        Origin: window.location.origin
+      },
+      body: JSON.stringify({ action, expectedEditVersion })
+    });
+    if (!response.ok) {
+      setError(response.status === 409 ? 'Reminder changed elsewhere. Reload and try again.' : 'Unable to update reminder.');
+      return;
+    }
+    await loadDashboard();
+  };
+
+  const deleteReminder = async (reminderId: string, expectedEditVersion: number) => {
+    setError('');
+    const response = await fetch(`/api/reminders/${reminderId}?expectedEditVersion=${expectedEditVersion}`, {
+      method: 'DELETE',
+      credentials: 'same-origin',
+      headers: { 'X-CSRF-Token': csrfToken, Origin: window.location.origin }
+    });
+    if (!response.ok) {
+      setError(response.status === 409 ? 'Reminder changed elsewhere. Reload and try again.' : 'Unable to delete reminder.');
+      return;
+    }
+    await loadDashboard();
+  };
+
+  const setSubscription = async (recipient: Recipient, subscribed: boolean) => {
+    setError('');
+    const response = await fetch(`/api/recipients/${recipient.recipientId}/subscription`, {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': csrfToken,
+        Origin: window.location.origin
+      },
+      body: JSON.stringify({ expectedVersion: recipient.version, subscribed })
+    });
+    if (!response.ok) {
+      setError(response.status === 409 ? 'Recipient changed elsewhere. Reload and try again.' : 'Unable to update recipient preference.');
+      return;
+    }
+    await loadRecipients();
   };
 
   return (
@@ -83,7 +156,27 @@ function App() {
         <section>
           <h2>Upcoming reminders</h2>
           {data.reminders.length === 0 ? <p className="muted">No upcoming reminders.</p> :
-            data.reminders.map((item) => <article key={item.id}><strong>{item.title}</strong><span>{item.nextDueAt}</span><Badge value={item.state} /></article>)}
+            data.reminders.map((item) => <article key={item.id}>
+              <strong>{item.title}</strong><span>{item.nextDueAt}</span><Badge value={item.state} />
+              <span>
+                {item.state === 'paused'
+                  ? <button type="button" onClick={() => void patchReminder(item.id, item.editVersion, 'resume')}>Resume</button>
+                  : <button type="button" onClick={() => void patchReminder(item.id, item.editVersion, 'pause')}>Pause</button>}
+                <button type="button" onClick={() => void deleteReminder(item.id, item.editVersion)}>Delete</button>
+              </span>
+            </article>)}
+        </section>
+        <section>
+          <h2>Recipient preferences</h2>
+          {recipients.length === 0 ? <p className="muted">No recipients.</p> : recipients.map((recipient) => (
+            <article key={recipient.recipientId}>
+              <strong>{recipient.email}</strong>
+              <Badge value={recipient.unsubscribedAt ? 'unsubscribed' : recipient.consentedAt ? 'subscribed' : 'pending'} />
+              {recipient.unsubscribedAt
+                ? <button type="button" onClick={() => void setSubscription(recipient, true)}>Resubscribe</button>
+                : <button type="button" onClick={() => void setSubscription(recipient, false)}>Unsubscribe</button>}
+            </article>
+          ))}
         </section>
         <section>
           <h2>Services</h2>

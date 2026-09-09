@@ -61,6 +61,89 @@ test('sessions enforce csrf and workspace isolation', async () => {
   assert.notEqual((await service.listReminders(authA))[0]?.reminderId, (await service.listReminders(authB))[0]?.reminderId);
 });
 
+test('reminder edit pause resume delete enforce optimistic conflicts and lifecycle changes', async () => {
+  const clock = new TestClock('2026-01-01T00:00:00.000Z');
+  const repo = new InMemoryRepo(clock);
+  const service = new AppService(repo, new FakeMailer(true), () => clock.now());
+  const invite = await service.createInvite('ws-a', 'owner@example.com');
+  const verified = await service.verifyInvite(invite);
+  const context = await service.authenticate(verified.sessionToken, verified.csrfToken, true);
+
+  const created = await service.createReminder(context, {
+    title: 'Original',
+    schedule: { kind: 'elapsed', zone: 'UTC', startAt: '2026-01-01T00:01:00.000Z', intervalMinutes: 60 }
+  });
+  const edited = await service.editReminder(context, {
+    reminderId: created.reminderId,
+    expectedEditVersion: created.editVersion,
+    title: 'Edited',
+    schedule: { kind: 'elapsed', zone: 'UTC', startAt: '2026-01-01T00:02:00.000Z', intervalMinutes: 60 }
+  });
+  assert.equal(edited.editVersion, created.editVersion + 1);
+  await assert.rejects(() =>
+    service.pauseReminder(context, created.reminderId, created.editVersion)
+  );
+
+  const paused = await service.pauseReminder(context, created.reminderId, edited.editVersion);
+  assert.ok(paused.pausedAt);
+  const resumed = await service.resumeReminder(context, created.reminderId, paused.editVersion);
+  assert.equal(resumed.pausedAt, undefined);
+  await service.deleteReminder(context, created.reminderId, resumed.editVersion);
+  assert.equal((await service.listReminders(context)).length, 0);
+});
+
+test('recipient unsubscribe between queue and send suppresses delivery', async () => {
+  const clock = new TestClock('2026-01-01T00:00:00.000Z');
+  const repo = new InMemoryRepo(clock);
+  const mailer = new FakeMailer(true);
+  const service = new AppService(repo, mailer, () => clock.now());
+  const invite = await service.createInvite('ws-a', 'owner@example.com');
+  const verified = await service.verifyInvite(invite);
+  const context = await service.authenticate(verified.sessionToken, verified.csrfToken, true);
+
+  const reminder = await service.createReminder(context, {
+    title: 'Subscription bill',
+    schedule: { kind: 'elapsed', zone: 'UTC', startAt: '2026-01-01T00:01:00.000Z', intervalMinutes: 60 }
+  });
+  clock.set('2026-01-01T00:01:00.000Z');
+  assert.equal(await service.schedulerTick(), 1);
+  const recipients = await service.listRecipients(context);
+  assert.equal(recipients.length, 1);
+  await service.setRecipientSubscription(context, {
+    recipientId: recipients[0]!.recipientId,
+    expectedVersion: recipients[0]!.version,
+    subscribed: false
+  });
+
+  assert.equal(await service.emailWorkerTick(), 0);
+  assert.equal(mailer.sent.length, 0);
+  assert.deepEqual(repo.getNotificationStates(context.workspaceId), ['suppressed']);
+});
+
+test('push monitor service creation and token rotation only expose full URL once per action', async () => {
+  const clock = new TestClock('2026-01-01T00:00:00.000Z');
+  const repo = new InMemoryRepo(clock);
+  const service = new AppService(repo, new FakeMailer(true), () => clock.now());
+  const invite = await service.createInvite('ws-a', 'owner@example.com');
+  const verified = await service.verifyInvite(invite);
+  const context = await service.authenticate(verified.sessionToken, verified.csrfToken, true);
+
+  const app = await service.createService(context, 'Payments API');
+  const monitor = await service.createPushMonitor(context, {
+    serviceId: app.serviceId,
+    publicBaseUrl: 'https://example.test',
+    startExpectingNow: true
+  });
+  assert.match(monitor.heartbeatUrl, /^https:\/\/example\.test\/h\/[A-Za-z0-9_-]{43}$/);
+  const listed = await service.listPushMonitors(context);
+  assert.equal(listed.length, 1);
+  assert.equal((listed[0] as { heartbeatUrl?: string }).heartbeatUrl, undefined);
+
+  const rotated = await service.rotatePushMonitorToken(context, listed[0]!.monitorId, 'https://example.test');
+  assert.match(rotated.heartbeatUrl, /^https:\/\/example\.test\/h\/[A-Za-z0-9_-]{43}$/);
+  assert.notEqual(rotated.heartbeatUrl, monitor.heartbeatUrl);
+});
+
 class TestClock {
   private value: Date;
   constructor(iso: string) {
@@ -81,25 +164,52 @@ type SessionRow = { sessionId: string; userId: string; workspaceId: string; emai
 type ReminderRow = {
   workspaceId: string;
   reminderId: string;
-  recipientEmail: string;
+  recipientId: string;
   title: string;
   note: string | undefined;
   schedule: ReminderSchedule;
   nextDueAt: Date | undefined;
   pausedAt: Date | undefined;
+  deletedAt: Date | undefined;
   scheduleVersion: number;
   editVersion: number;
+};
+type RecipientRow = {
+  workspaceId: string;
+  recipientId: string;
+  email: string;
+  ownershipVerifiedAt: Date | undefined;
+  consentedAt: Date | undefined;
+  unsubscribedAt: Date | undefined;
+  version: number;
 };
 type NotificationRow = {
   workspaceId: string;
   notificationId: string;
+  eventId: string;
+  reminderId: string | undefined;
+  scheduleVersion: number | undefined;
+  recipientId: string;
   recipientEmail: string;
   subject: string;
   textBody: string;
-  state: 'queued' | 'submitting' | 'retrying' | 'smtp-accepted' | 'failed' | 'outcome-unknown';
+  state: 'queued' | 'submitting' | 'retrying' | 'smtp-accepted' | 'failed' | 'outcome-unknown' | 'suppressed';
   attempts: number;
   availableAt: Date;
   updatedAt: Date;
+};
+type ServiceRow = { workspaceId: string; serviceId: string; name: string; deletedAt?: Date };
+type PushMonitorRow = {
+  workspaceId: string;
+  monitorId: string;
+  serviceId: string;
+  state: 'healthy' | 'failing' | 'down' | 'unknown' | 'paused';
+  intervalMs: number;
+  graceMs: number;
+  pausedAt: Date | undefined;
+  lastEvidenceAt: Date | undefined;
+  editVersion: number;
+  tokenHash: string;
 };
 
 class InMemoryRepo implements AppRepository {
@@ -107,7 +217,10 @@ class InMemoryRepo implements AppRepository {
   private users = new Map<string, string>();
   private sessions: SessionRow[] = [];
   private reminders: ReminderRow[] = [];
+  private recipients: RecipientRow[] = [];
   private notifications: NotificationRow[] = [];
+  private services: ServiceRow[] = [];
+  private pushMonitors: PushMonitorRow[] = [];
 
   constructor(private readonly clock: TestClock) {}
 
@@ -183,35 +296,169 @@ class InMemoryRepo implements AppRepository {
     schedule: ReminderSchedule;
     nextDueAt: Date | undefined;
   }) {
+    const recipient = this.ensureRecipient(input.workspaceId, input.recipientEmail);
     const row: ReminderRow = {
       workspaceId: input.workspaceId,
       reminderId: input.reminderId,
-      recipientEmail: input.recipientEmail,
+      recipientId: recipient.recipientId,
       title: input.title,
       note: input.note,
       schedule: input.schedule,
       nextDueAt: input.nextDueAt,
       pausedAt: undefined,
+      deletedAt: undefined,
       scheduleVersion: 1,
       editVersion: 1
     };
     this.reminders.push(row);
-    return row;
+    return this.asReminder(row);
   }
 
   async listReminders(workspaceId: string) {
-    return this.reminders.filter((row) => row.workspaceId === workspaceId);
+    return this.reminders.filter((row) => row.workspaceId === workspaceId && !row.deletedAt).map((row) => this.asReminder(row));
+  }
+
+  async updateReminder(input: {
+    workspaceId: string;
+    reminderId: string;
+    expectedEditVersion: number;
+    title: string;
+    note: string | undefined;
+    schedule: ReminderSchedule;
+    nextDueAt: Date | undefined;
+  }) {
+    const row = this.reminders.find((item) => item.workspaceId === input.workspaceId && item.reminderId === input.reminderId && !item.deletedAt);
+    if (!row) return 'not-found' as const;
+    if (row.editVersion !== input.expectedEditVersion) return 'conflict' as const;
+    row.title = input.title;
+    row.note = input.note;
+    row.schedule = input.schedule;
+    row.nextDueAt = input.nextDueAt;
+    row.pausedAt = undefined;
+    row.editVersion += 1;
+    row.scheduleVersion += 1;
+    return this.asReminder(row);
+  }
+
+  async pauseReminder(input: { workspaceId: string; reminderId: string; expectedEditVersion: number; now: Date }) {
+    const row = this.reminders.find((item) => item.workspaceId === input.workspaceId && item.reminderId === input.reminderId && !item.deletedAt);
+    if (!row) return 'not-found' as const;
+    if (row.editVersion !== input.expectedEditVersion) return 'conflict' as const;
+    row.pausedAt = input.now;
+    row.nextDueAt = undefined;
+    row.editVersion += 1;
+    row.scheduleVersion += 1;
+    return this.asReminder(row);
+  }
+
+  async resumeReminder(input: { workspaceId: string; reminderId: string; expectedEditVersion: number; now: Date; nextDueAt: Date | undefined }) {
+    const row = this.reminders.find((item) => item.workspaceId === input.workspaceId && item.reminderId === input.reminderId && !item.deletedAt);
+    if (!row) return 'not-found' as const;
+    if (row.editVersion !== input.expectedEditVersion) return 'conflict' as const;
+    row.pausedAt = undefined;
+    row.nextDueAt = input.nextDueAt;
+    row.editVersion += 1;
+    row.scheduleVersion += 1;
+    return this.asReminder(row);
+  }
+
+  async deleteReminder(input: { workspaceId: string; reminderId: string; expectedEditVersion: number; now: Date }) {
+    const row = this.reminders.find((item) => item.workspaceId === input.workspaceId && item.reminderId === input.reminderId && !item.deletedAt);
+    if (!row) return 'not-found' as const;
+    if (row.editVersion !== input.expectedEditVersion) return 'conflict' as const;
+    row.deletedAt = input.now;
+    row.pausedAt = input.now;
+    row.nextDueAt = undefined;
+    row.editVersion += 1;
+    row.scheduleVersion += 1;
+    return 'deleted' as const;
+  }
+
+  async listRecipients(workspaceId: string) {
+    return this.recipients.filter((row) => row.workspaceId === workspaceId).map((row) => ({ ...row }));
+  }
+
+  async setRecipientSubscription(input: {
+    workspaceId: string;
+    recipientId: string;
+    expectedVersion: number;
+    subscribed: boolean;
+    now: Date;
+  }) {
+    const row = this.recipients.find((item) => item.workspaceId === input.workspaceId && item.recipientId === input.recipientId);
+    if (!row) return 'not-found' as const;
+    if (row.version !== input.expectedVersion) return 'conflict' as const;
+    row.consentedAt = input.subscribed ? row.consentedAt ?? input.now : undefined;
+    row.unsubscribedAt = input.subscribed ? undefined : input.now;
+    row.version += 1;
+    return { ...row };
+  }
+
+  async listServices(workspaceId: string) {
+    return this.services.filter((row) => row.workspaceId === workspaceId && !row.deletedAt).map((row) => ({ serviceId: row.serviceId, name: row.name }));
+  }
+
+  async createService(input: { workspaceId: string; serviceId: string; name: string }) {
+    const row: ServiceRow = { workspaceId: input.workspaceId, serviceId: input.serviceId, name: input.name };
+    this.services.push(row);
+    return { serviceId: row.serviceId, name: row.name };
+  }
+
+  async listPushMonitors(workspaceId: string) {
+    return this.pushMonitors.filter((row) => row.workspaceId === workspaceId).map((row) => ({ ...row }));
+  }
+
+  async createPushMonitor(input: {
+    workspaceId: string;
+    serviceId: string;
+    monitorId: string;
+    intervalMs: number;
+    graceMs: number;
+    startExpectingNow: boolean;
+    now: Date;
+    tokenHash: string;
+  }) {
+    const service = this.services.find((row) => row.workspaceId === input.workspaceId && row.serviceId === input.serviceId && !row.deletedAt);
+    if (!service) return 'not-found' as const;
+    const created: PushMonitorRow = {
+      workspaceId: input.workspaceId,
+      monitorId: input.monitorId,
+      serviceId: input.serviceId,
+      state: 'unknown',
+      intervalMs: input.intervalMs,
+      graceMs: input.graceMs,
+      pausedAt: undefined,
+      lastEvidenceAt: undefined,
+      editVersion: 1,
+      tokenHash: input.tokenHash
+    };
+    this.pushMonitors.push(created);
+    return { ...created };
+  }
+
+  async rotatePushMonitorToken(input: { workspaceId: string; monitorId: string; now: Date; tokenHash: string }) {
+    const row = this.pushMonitors.find((item) => item.workspaceId === input.workspaceId && item.monitorId === input.monitorId);
+    if (!row) return 'not-found' as const;
+    row.tokenHash = input.tokenHash;
+    return 'rotated' as const;
   }
 
   async runReminderSchedulerTick(now: Date, limit: number): Promise<number> {
     const due = this.reminders
-      .filter((row) => row.nextDueAt && row.nextDueAt <= now)
+      .filter((row) => !row.deletedAt && !row.pausedAt && row.nextDueAt && row.nextDueAt <= now)
       .slice(0, limit);
     for (const row of due) {
+      const recipient = this.recipients.find((item) => item.workspaceId === row.workspaceId && item.recipientId === row.recipientId);
+      if (!recipient || !recipient.ownershipVerifiedAt || !recipient.consentedAt || recipient.unsubscribedAt) continue;
+      const dueAt = row.nextDueAt ?? now;
       this.notifications.push({
         workspaceId: row.workspaceId,
         notificationId: `${row.reminderId}:${row.scheduleVersion}`,
-        recipientEmail: row.recipientEmail,
+        eventId: `reminder:${row.reminderId}:${row.scheduleVersion}:${dueAt.toISOString()}`,
+        reminderId: row.reminderId,
+        scheduleVersion: row.scheduleVersion,
+        recipientId: row.recipientId,
+        recipientEmail: recipient.email,
         subject: row.title,
         textBody: `${row.title} is due`,
         state: 'queued',
@@ -229,12 +476,32 @@ class InMemoryRepo implements AppRepository {
     const ready = this.notifications
       .filter((row) => (row.state === 'queued' || row.state === 'retrying') && row.availableAt <= now)
       .slice(0, limit);
+    const claimable: NotificationRow[] = [];
     for (const row of ready) {
+      const recipient = this.recipients.find((item) => item.workspaceId === row.workspaceId && item.recipientId === row.recipientId);
+      const reminder = row.reminderId
+        ? this.reminders.find((item) => item.workspaceId === row.workspaceId && item.reminderId === row.reminderId)
+        : undefined;
+      if (
+        !recipient ||
+        !recipient.ownershipVerifiedAt ||
+        !recipient.consentedAt ||
+        !!recipient.unsubscribedAt ||
+        !reminder ||
+        !!reminder.deletedAt ||
+        !!reminder.pausedAt ||
+        row.scheduleVersion !== reminder.scheduleVersion - 1
+      ) {
+        row.state = 'suppressed';
+        row.updatedAt = now;
+        continue;
+      }
       row.state = 'submitting';
       row.attempts += 1;
       row.updatedAt = now;
+      claimable.push(row);
     }
-    return ready.map((row) => ({
+    return claimable.map((row) => ({
       workspaceId: row.workspaceId,
       notificationId: row.notificationId,
       recipientEmail: row.recipientEmail,
@@ -273,7 +540,7 @@ class InMemoryRepo implements AppRepository {
   }
 
   async dashboard(workspaceId: string): Promise<{
-    reminders: Array<{ id: string; title: string; nextDueAt: string; state: string }>;
+    reminders: Array<{ id: string; title: string; nextDueAt: string; state: string; editVersion: number }>;
     services: Array<{ id: string; name: string; pullState: string | undefined; pushState: string | undefined }>;
     incidents: Array<{ id: string; service: string; mode: string; openedAt: string }>;
     notifications: Array<{ id: string; subject: string; state: string; updatedAt: string }>;
@@ -281,8 +548,14 @@ class InMemoryRepo implements AppRepository {
   }> {
     return {
       reminders: this.reminders
-        .filter((row) => row.workspaceId === workspaceId)
-        .map((row) => ({ id: row.reminderId, title: row.title, nextDueAt: row.nextDueAt?.toISOString() ?? 'none', state: 'active' })),
+        .filter((row) => row.workspaceId === workspaceId && !row.deletedAt)
+        .map((row) => ({
+          id: row.reminderId,
+          title: row.title,
+          nextDueAt: row.nextDueAt?.toISOString() ?? 'none',
+          state: row.pausedAt ? 'paused' : row.nextDueAt ? 'active' : 'completed',
+          editVersion: row.editVersion
+        })),
       services: [{ id: 'pull-disabled', name: 'Pull monitor execution', pullState: 'disabled', pushState: undefined }],
       incidents: [],
       notifications: this.notifications
@@ -295,5 +568,29 @@ class InMemoryRepo implements AppRepository {
         monthlyLimit: 2500
       }
     };
+  }
+
+  getNotificationStates(workspaceId: string): string[] {
+    return this.notifications.filter((row) => row.workspaceId === workspaceId).map((row) => row.state);
+  }
+
+  private ensureRecipient(workspaceId: string, email: string): RecipientRow {
+    const existing = this.recipients.find((row) => row.workspaceId === workspaceId && row.email === email);
+    if (existing) return existing;
+    const created: RecipientRow = {
+      workspaceId,
+      recipientId: `${workspaceId}:${email}`,
+      email,
+      ownershipVerifiedAt: this.clock.now(),
+      consentedAt: this.clock.now(),
+      unsubscribedAt: undefined,
+      version: 1
+    };
+    this.recipients.push(created);
+    return created;
+  }
+
+  private asReminder(row: ReminderRow): ReminderRow {
+    return { ...row };
   }
 }

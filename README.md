@@ -18,8 +18,9 @@ The MVP foundation includes:
 ## Current implementation boundary
 
 This remains an incremental MVP. A runnable vertical slice now exists for invite verification +
-authenticated reminder creation/listing + Oracle-backed scheduler and email-worker loops. Push
-heartbeat ingress and Oracle receipt persistence are also implemented. **Outbound pull execution is
+authenticated reminder create/list/edit/pause/resume/delete, recipient subscription preferences,
+workspace service + push monitor create/list/rotate, and Oracle-backed scheduler/email-worker loops.
+Push heartbeat ingress and Oracle receipt persistence are also implemented. **Outbound pull execution is
 fail-closed**, because this repository
 does not yet demonstrate the required DNS pinning, TLS/SNI validation, redirect/header/body/time
 bounds, process isolation, and independent egress containment. Do not enable it by substituting a
@@ -94,7 +95,9 @@ must never appear in application logs, traces, error reports, analytics, or UI h
 - [`docs/openapi.yaml`](docs/openapi.yaml) documents reminder CRUD/preview/pause/resume,
   subscriptions, services/monitors, authorization, rotation, test checks, maintenance, incidents,
   notification history, authentication, and ingestion. Current implementation covers invite verify,
-  sign-out, reminders list/create/preview, dashboard, scheduler, and email-worker vertical slice.
+  sign-out, reminders list/create/edit/pause/resume/delete + preview, recipients list/subscription
+  updates, services list/create, push monitor list/create/rotate, dashboard, scheduler, and
+  email-worker vertical slice. Deadline-evaluator incident/recovery orchestration remains incomplete.
 
 All owned rows carry `workspace_id`; composite foreign keys prevent cross-workspace references.
 Every runtime query must be workspace-scoped and parameter-bound. Optimistic edit and schedule/config
