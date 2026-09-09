@@ -91,7 +91,14 @@ must never appear in application logs, traces, error reports, analytics, or UI h
 - [`migrations/001_mvp.sql`](migrations/001_mvp.sql) contains versioned Oracle DDL. It has not been
   executed against Oracle. Review identifiers, JSON checks, timestamp bindings, conditional unique
   indexes, wallet/connectivity, and the documented `FOR UPDATE SKIP LOCKED` claim transaction on the
-  exact existing service first.
+  exact existing service first. Every statement in this file (including creation of the
+  `schema_migrations` tracking table itself) is written to be idempotent - safe to apply more than
+  once, whether directly via SQLcl/SQL Developer or via `npm run migrate` - by validating that a
+  colliding existing object is type- and column-count-compatible before treating it as already
+  applied; incompatible objects stop the script instead of being silently accepted. See
+  [`migrations/README.md`](migrations/README.md) for the exact guarantees, limits (this is not a
+  full schema/DDL diff and is not a rollback mechanism), and the single-operator concurrency
+  caveat.
 - [`docs/openapi.yaml`](docs/openapi.yaml) documents reminder CRUD/preview/pause/resume,
   subscriptions, services/monitors, authorization, rotation, test checks, maintenance, incidents,
   notification history, authentication, and ingestion. Current implementation covers invite verify,
