@@ -52,10 +52,12 @@ export class OracleHeartbeatStore implements HeartbeatStore {
           return { accepted: true, duplicate: true };
         }
       }
+      // The physical column is MONITOR_MODE: Oracle rejects MODE as an identifier (ORA-03050).
+      // The API/domain JSON property is unaffected and remains `mode`.
       const monitor = await connection.execute<{ DEADLINE_VERSION: number; LAST_EVIDENCE_AT: Date | null }>(
         `SELECT deadline_version, last_evidence_at FROM monitors
           WHERE workspace_id = :workspace_id AND monitor_id = :monitor_id
-            AND mode = 'push' AND paused_at IS NULL AND deleted_at IS NULL
+            AND monitor_mode = 'push' AND paused_at IS NULL AND deleted_at IS NULL
           FOR UPDATE`,
         { workspace_id: row.WORKSPACE_ID, monitor_id: row.MONITOR_ID },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }

@@ -612,6 +612,8 @@ export class OracleAppRepository implements AppRepository {
     editVersion: number;
   }>> {
     return this.withConnection(async (connection) => {
+      // The physical column is MONITOR_MODE: Oracle rejects MODE as an identifier (ORA-03050).
+      // The API/domain JSON property is unaffected and remains `mode`.
       const rows = await connection.execute<{
         MONITOR_ID: string;
         SERVICE_ID: string;
@@ -624,7 +626,7 @@ export class OracleAppRepository implements AppRepository {
         `SELECT monitor_id, service_id, state, config_json, paused_at, last_evidence_at, edit_version
            FROM monitors
           WHERE workspace_id = :workspace_id
-            AND mode = 'push'
+            AND monitor_mode = 'push'
             AND deleted_at IS NULL
           ORDER BY monitor_id`,
         { workspace_id: workspaceId },
@@ -682,7 +684,7 @@ export class OracleAppRepository implements AppRepository {
       }
       await connection.execute(
         `INSERT INTO monitors(
-           workspace_id, monitor_id, service_id, mode, state, config_json, config_version, deadline_version, edit_version,
+           workspace_id, monitor_id, service_id, monitor_mode, state, config_json, config_version, deadline_version, edit_version,
            next_check_at, last_evidence_at
          ) VALUES (
            :workspace_id, :monitor_id, :service_id, 'push', 'unknown', :config_json, 1, 0, 1,

@@ -21,6 +21,12 @@
 -- (`schema_migrations`) was populated by some other means (e.g. a previously interrupted run).
 -- This script only documents/supports being applied by a single operator at a time; concurrent
 -- execution across two sessions is not tested and is not covered by these idempotency guarantees.
+--
+-- Reserved words: Oracle rejects MODE as an identifier (ORA-03050 - see
+-- https://docs.oracle.com/error-help/db/ora-03050/), so the monitors table stores its pull/push
+-- discriminator in MONITOR_MODE. If an existing MONITORS table still has the legacy quoted "MODE"
+-- column, the ORA-00955 branch validates it and renames it in place (no data is copied, dropped or
+-- recreated); ambiguous states (both columns, or neither) stop the script with an actionable error.
 DECLARE
   TYPE t_name_tab IS TABLE OF VARCHAR2(30) INDEX BY PLS_INTEGER;
   TYPE t_kind_tab IS TABLE OF VARCHAR2(60) INDEX BY PLS_INTEGER;
@@ -85,6 +91,71 @@ DECLARE
         'Migration 001: table ' || p_table_name || ' must have exactly one UTC-epoch deduplication ' ||
         'key on (workspace_id, ' || LOWER(p_entity_column) || ', ' || LOWER(p_version_column) ||
         ', ' || LOWER(p_epoch_column) || ').');
+    END IF;
+  END;
+
+  -- Oracle rejects MODE as an identifier (ORA-03050: invalid identifier: "MODE" is a reserved
+  -- word), so the physical column is MONITOR_MODE while the API/domain JSON property stays `mode`.
+  -- Installs created before that rename carry a quoted "MODE" column. This validates the shape of
+  -- whichever column exists and performs the single non-destructive transition
+  -- (ALTER TABLE ... RENAME COLUMN), which preserves every row, the NOT NULL constraint and the
+  -- pull/push check condition. It never drops, recreates or copies data.
+  PROCEDURE ensure_monitor_mode_column(p_migration VARCHAR2) IS
+    v_legacy PLS_INTEGER;
+    v_current PLS_INTEGER;
+    v_valid PLS_INTEGER;
+    v_check PLS_INTEGER;
+    v_column VARCHAR2(30);
+  BEGIN
+    SELECT COUNT(*) INTO v_legacy
+      FROM user_tab_columns WHERE table_name = 'MONITORS' AND column_name = 'MODE';
+    SELECT COUNT(*) INTO v_current
+      FROM user_tab_columns WHERE table_name = 'MONITORS' AND column_name = 'MONITOR_MODE';
+
+    IF v_legacy > 0 AND v_current > 0 THEN
+      RAISE_APPLICATION_ERROR(-20009,
+        p_migration || ': table MONITORS has both the legacy "MODE" column and MONITOR_MODE. ' ||
+        'That state is ambiguous and is never resolved automatically; consolidate the values ' ||
+        'manually (see migrations/README.md) before rerunning.');
+    ELSIF v_legacy = 0 AND v_current = 0 THEN
+      RAISE_APPLICATION_ERROR(-20010,
+        p_migration || ': table MONITORS has neither MONITOR_MODE nor a legacy "MODE" column, so ' ||
+        'it is not a compatible monitors table. Resolve manually before rerunning.');
+    END IF;
+
+    IF v_current > 0 THEN
+      v_column := 'MONITOR_MODE';
+    ELSE
+      v_column := 'MODE';
+    END IF;
+    SELECT COUNT(*) INTO v_valid
+      FROM user_tab_columns
+     WHERE table_name = 'MONITORS'
+       AND column_name = v_column
+       AND data_type = 'VARCHAR2'
+       AND char_length = 8
+       AND nullable = 'N';
+    IF v_valid != 1 THEN
+      RAISE_APPLICATION_ERROR(-20011,
+        p_migration || ': MONITORS.' || v_column || ' must be VARCHAR2(8) NOT NULL before it can ' ||
+        'be used as the monitor mode column. Resolve manually before rerunning.');
+    END IF;
+
+    SELECT COUNT(*) INTO v_check
+      FROM user_constraints
+     WHERE table_name = 'MONITORS'
+       AND constraint_type = 'C'
+       AND UPPER(search_condition_vc) LIKE '%PULL%'
+       AND UPPER(search_condition_vc) LIKE '%PUSH%';
+    IF v_check < 1 THEN
+      RAISE_APPLICATION_ERROR(-20012,
+        p_migration || ': MONITORS is missing a CHECK constraint restricting the monitor mode to ' ||
+        '''pull''/''push''. Add it manually before rerunning.');
+    END IF;
+
+    IF v_current = 0 THEN
+      -- The legacy name must be quoted here precisely because it is a reserved word.
+      EXECUTE IMMEDIATE 'ALTER TABLE monitors RENAME COLUMN "MODE" TO monitor_mode';
     END IF;
   END;
 BEGIN
@@ -243,7 +314,7 @@ BEGIN
   workspace_id VARCHAR2(36) NOT NULL,
   monitor_id VARCHAR2(36) NOT NULL,
   service_id VARCHAR2(36) NOT NULL,
-  mode VARCHAR2(8) NOT NULL CHECK (mode IN (''pull'', ''push'')),
+  monitor_mode VARCHAR2(8) NOT NULL CHECK (monitor_mode IN (''pull'', ''push'')),
   state VARCHAR2(16) DEFAULT ''unknown'' NOT NULL,
   config_json CLOB NOT NULL CHECK (config_json IS JSON),
   config_version NUMBER(10) DEFAULT 1 NOT NULL,
@@ -470,6 +541,8 @@ BEGIN
           ELSIF v_name(i) = 'CHECK_RUNS' THEN
             verify_epoch_deduplication(
               'CHECK_RUNS', 'SLOT_AT', 'SLOT_AT_EPOCH', 'MONITOR_ID', 'CONFIG_VERSION');
+          ELSIF v_name(i) = 'MONITORS' THEN
+            ensure_monitor_mode_column('Migration 001');
           END IF;
         ELSE
           v_table_name := SUBSTR(v_kind(i), INSTR(v_kind(i), ':') + 1);

@@ -99,6 +99,12 @@ must never appear in application logs, traces, error reports, analytics, or UI h
   [`migrations/README.md`](migrations/README.md) for the exact guarantees, limits (this is not a
   full schema/DDL diff and is not a rollback mechanism), and the single-operator concurrency
   caveat.
+- [`migrations/002_monitor_mode.sql`](migrations/002_monitor_mode.sql) is the forward migration for
+  installs that already recorded version 1 with the old `monitors.mode` column, which Oracle rejects
+  with `ORA-03050: invalid identifier: "MODE" is a reserved word`. The physical column is
+  `MONITOR_MODE`; the API/domain JSON property remains `mode`. See
+  [`migrations/README.md`](migrations/README.md) for the reserved-word audit, its limits, and the
+  read-only `V$RESERVED_WORDS` inspection you can opt into.
 - [`docs/openapi.yaml`](docs/openapi.yaml) documents reminder CRUD/preview/pause/resume,
   subscriptions, services/monitors, authorization, rotation, test checks, maintenance, incidents,
   notification history, authentication, and ingestion. Current implementation covers invite verify,
