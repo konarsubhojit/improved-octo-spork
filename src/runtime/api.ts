@@ -106,9 +106,166 @@ async function handle(request: IncomingMessage, response: ServerResponse): Promi
     });
   }
 
+  const reminderMatch = /^\/api\/reminders\/([0-9a-fA-F-]{36})$/.exec(url.pathname);
+  if (request.method === 'PATCH' && reminderMatch?.[1]) {
+    const data = asRecord(body);
+    const expectedEditVersion = Number(data.expectedEditVersion);
+    if (!Number.isInteger(expectedEditVersion) || expectedEditVersion < 1) {
+      return writeJson(response, 422, { error: 'expectedEditVersion must be a positive integer' });
+    }
+    const action = data.action;
+    try {
+      if (action === 'pause') {
+        const updated = await service.pauseReminder(context, reminderMatch[1], expectedEditVersion);
+        return writeJson(response, 200, reminderPayload(updated));
+      }
+      if (action === 'resume') {
+        const updated = await service.resumeReminder(context, reminderMatch[1], expectedEditVersion);
+        return writeJson(response, 200, reminderPayload(updated));
+      }
+      const title = data.title;
+      const schedule = data.schedule;
+      if (typeof title !== 'string' || !schedule || typeof schedule !== 'object') {
+        return writeJson(response, 422, { error: 'title and schedule are required for edit' });
+      }
+      const updated = await service.editReminder(
+        context,
+        typeof data.note === 'string'
+          ? { reminderId: reminderMatch[1], expectedEditVersion, title, note: data.note, schedule: schedule as ReminderSchedule }
+          : { reminderId: reminderMatch[1], expectedEditVersion, title, schedule: schedule as ReminderSchedule }
+      );
+      return writeJson(response, 200, reminderPayload(updated));
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === 'Conflict') return writeJson(response, 409, { error: 'edit conflict' });
+      if (error instanceof Error && error.message === 'Not found') return writeJson(response, 404, { error: 'Not found' });
+      throw error;
+    }
+  }
+
+  if (request.method === 'DELETE' && reminderMatch?.[1]) {
+    const expectedEditVersion = Number(url.searchParams.get('expectedEditVersion'));
+    if (!Number.isInteger(expectedEditVersion) || expectedEditVersion < 1) {
+      return writeJson(response, 422, { error: 'expectedEditVersion query parameter is required' });
+    }
+    try {
+      await service.deleteReminder(context, reminderMatch[1], expectedEditVersion);
+      return writeJson(response, 204, {});
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === 'Conflict') return writeJson(response, 409, { error: 'edit conflict' });
+      if (error instanceof Error && error.message === 'Not found') return writeJson(response, 404, { error: 'Not found' });
+      throw error;
+    }
+  }
+
+  if (request.method === 'GET' && url.pathname === '/api/recipients') {
+    const recipients = await service.listRecipients(context);
+    return writeJson(response, 200, {
+      recipients: recipients.map((row) => ({
+        recipientId: row.recipientId,
+        email: row.email,
+        ownershipVerifiedAt: row.ownershipVerifiedAt?.toISOString() ?? null,
+        consentedAt: row.consentedAt?.toISOString() ?? null,
+        unsubscribedAt: row.unsubscribedAt?.toISOString() ?? null,
+        version: row.version
+      }))
+    });
+  }
+
+  const recipientMatch = /^\/api\/recipients\/([0-9a-fA-F-]{36})\/subscription$/.exec(url.pathname);
+  if (request.method === 'PUT' && recipientMatch?.[1]) {
+    const data = asRecord(body);
+    const expectedVersion = Number(data.expectedVersion);
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 1 || typeof data.subscribed !== 'boolean') {
+      return writeJson(response, 422, { error: 'expectedVersion and subscribed are required' });
+    }
+    try {
+      const updated = await service.setRecipientSubscription(context, {
+        recipientId: recipientMatch[1],
+        expectedVersion,
+        subscribed: data.subscribed
+      });
+      return writeJson(response, 200, {
+        recipientId: updated.recipientId,
+        email: updated.email,
+        ownershipVerifiedAt: updated.ownershipVerifiedAt?.toISOString() ?? null,
+        consentedAt: updated.consentedAt?.toISOString() ?? null,
+        unsubscribedAt: updated.unsubscribedAt?.toISOString() ?? null,
+        version: updated.version
+      });
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === 'Conflict') return writeJson(response, 409, { error: 'version conflict' });
+      if (error instanceof Error && error.message === 'Not found') return writeJson(response, 404, { error: 'Not found' });
+      throw error;
+    }
+  }
+
   if (request.method === 'GET' && url.pathname === '/api/dashboard') {
     const dashboard = await service.dashboard(context);
     return writeJson(response, 200, dashboard);
+  }
+
+  if (request.method === 'GET' && url.pathname === '/api/services') {
+    const services = await service.listServices(context);
+    const monitors = await service.listPushMonitors(context);
+    return writeJson(response, 200, {
+      services: services.map((item) => ({
+        serviceId: item.serviceId,
+        name: item.name,
+        pushMonitors: monitors.filter((row) => row.serviceId === item.serviceId).map((row) => ({
+          monitorId: row.monitorId,
+          state: row.state,
+          intervalMs: row.intervalMs,
+          graceMs: row.graceMs,
+          pausedAt: row.pausedAt?.toISOString() ?? null,
+          lastEvidenceAt: row.lastEvidenceAt?.toISOString() ?? null,
+          editVersion: row.editVersion
+        }))
+      }))
+    });
+  }
+
+  if (request.method === 'POST' && url.pathname === '/api/services') {
+    const name = asRecord(body).name;
+    if (typeof name !== 'string') return writeJson(response, 422, { error: 'name is required' });
+    const created = await service.createService(context, name);
+    return writeJson(response, 201, created);
+  }
+
+  const serviceMonitorsMatch = /^\/api\/services\/([0-9a-fA-F-]{36})\/monitors$/.exec(url.pathname);
+  if (request.method === 'POST' && serviceMonitorsMatch?.[1]) {
+    const data = asRecord(body);
+    if (data.mode !== 'push') return writeJson(response, 422, { error: 'Only push monitors are currently supported' });
+    try {
+      const monitorInput: {
+        serviceId: string;
+        intervalMs?: number;
+        graceMs?: number;
+        startExpectingNow?: boolean;
+        publicBaseUrl: string;
+      } = {
+        serviceId: serviceMonitorsMatch[1],
+        startExpectingNow: data.startExpectingNow === true,
+        publicBaseUrl: config.publicBaseUrl!
+      };
+      if (Number.isFinite(Number(data.intervalMs))) monitorInput.intervalMs = Number(data.intervalMs);
+      if (Number.isFinite(Number(data.graceMs))) monitorInput.graceMs = Number(data.graceMs);
+      const created = await service.createPushMonitor(context, monitorInput);
+      return writeJson(response, 201, created);
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === 'Not found') return writeJson(response, 404, { error: 'Not found' });
+      throw error;
+    }
+  }
+
+  const rotateMatch = /^\/api\/monitors\/([0-9a-fA-F-]{36})\/rotate$/.exec(url.pathname);
+  if (request.method === 'POST' && rotateMatch?.[1]) {
+    try {
+      const rotated = await service.rotatePushMonitorToken(context, rotateMatch[1], config.publicBaseUrl!);
+      return writeJson(response, 200, rotated);
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === 'Not found') return writeJson(response, 404, { error: 'Not found' });
+      throw error;
+    }
   }
 
   writeJson(response, 404, { error: 'Not found' });
@@ -135,6 +292,28 @@ function headerString(value: string | string[] | undefined): string | undefined 
 function asRecord(value: unknown): Record<string, unknown> {
   if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
   return {};
+}
+
+function reminderPayload(row: {
+  reminderId: string;
+  title: string;
+  note: string | undefined;
+  nextDueAt: Date | undefined;
+  pausedAt: Date | undefined;
+  scheduleVersion: number;
+  editVersion: number;
+  schedule: ReminderSchedule;
+}): Record<string, unknown> {
+  return {
+    reminderId: row.reminderId,
+    title: row.title,
+    note: row.note ?? null,
+    nextDueAt: row.nextDueAt?.toISOString() ?? null,
+    pausedAt: row.pausedAt?.toISOString() ?? null,
+    scheduleVersion: row.scheduleVersion,
+    editVersion: row.editVersion,
+    schedule: row.schedule
+  };
 }
 
 async function readBody(request: IncomingMessage): Promise<unknown> {

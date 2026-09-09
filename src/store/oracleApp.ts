@@ -2,7 +2,7 @@ import oracledb from 'oracledb';
 import { randomUUID } from 'node:crypto';
 import { nextOccurrences } from '../core/schedule.js';
 import type { ReminderSchedule } from '../core/types.js';
-import type { AppRepository, NotificationOutcome, NotificationWorkItem, ReminderRecord } from '../app/service.js';
+import type { AppRepository, NotificationOutcome, NotificationWorkItem, RecipientRecord, ReminderRecord } from '../app/service.js';
 
 export class OracleAppRepository implements AppRepository {
   constructor(private readonly pool: oracledb.Pool) {}
@@ -239,6 +239,535 @@ export class OracleAppRepository implements AppRepository {
     });
   }
 
+  async updateReminder(input: {
+    workspaceId: string;
+    reminderId: string;
+    expectedEditVersion: number;
+    title: string;
+    note: string | undefined;
+    schedule: ReminderSchedule;
+    nextDueAt: Date | undefined;
+  }): Promise<ReminderRecord | 'not-found' | 'conflict'> {
+    return this.withConnection(async (connection) => {
+      const current = await connection.execute<{
+        REMINDER_ID: string;
+        TITLE: string;
+        NOTE: string | null;
+        LOCAL_SCHEDULE_JSON: string;
+        NEXT_DUE_AT: Date | null;
+        PAUSED_AT: Date | null;
+        EDIT_VERSION: number;
+        SCHEDULE_VERSION: number;
+      }>(
+        `SELECT reminder_id, title, note, local_schedule_json, next_due_at, paused_at, edit_version, schedule_version
+           FROM reminders
+          WHERE workspace_id = :workspace_id
+            AND reminder_id = :reminder_id
+            AND deleted_at IS NULL
+          FOR UPDATE`,
+        { workspace_id: input.workspaceId, reminder_id: input.reminderId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const row = current.rows?.[0];
+      if (!row) {
+        await connection.rollback();
+        return 'not-found';
+      }
+      if (row.EDIT_VERSION !== input.expectedEditVersion) {
+        await connection.rollback();
+        return 'conflict';
+      }
+      await connection.execute(
+        `UPDATE reminders
+            SET title = :title,
+                note = :note,
+                schedule_kind = :schedule_kind,
+                zone = :zone,
+                local_schedule_json = :schedule_json,
+                next_due_at = :next_due_at,
+                paused_at = NULL,
+                edit_version = edit_version + 1,
+                schedule_version = schedule_version + 1
+          WHERE workspace_id = :workspace_id
+            AND reminder_id = :reminder_id`,
+        {
+          title: input.title,
+          note: input.note ?? null,
+          schedule_kind: input.schedule.kind,
+          zone: input.schedule.zone,
+          schedule_json: JSON.stringify(input.schedule),
+          next_due_at: input.nextDueAt ?? null,
+          workspace_id: input.workspaceId,
+          reminder_id: input.reminderId
+        }
+      );
+      await connection.commit();
+      return {
+        reminderId: input.reminderId,
+        title: input.title,
+        note: input.note,
+        schedule: input.schedule,
+        nextDueAt: input.nextDueAt,
+        pausedAt: undefined,
+        editVersion: row.EDIT_VERSION + 1,
+        scheduleVersion: row.SCHEDULE_VERSION + 1
+      };
+    });
+  }
+
+  async pauseReminder(input: {
+    workspaceId: string;
+    reminderId: string;
+    expectedEditVersion: number;
+    now: Date;
+  }): Promise<ReminderRecord | 'not-found' | 'conflict'> {
+    return this.withConnection(async (connection) => {
+      const current = await connection.execute<{
+        TITLE: string;
+        NOTE: string | null;
+        LOCAL_SCHEDULE_JSON: string;
+        EDIT_VERSION: number;
+        SCHEDULE_VERSION: number;
+      }>(
+        `SELECT title, note, local_schedule_json, edit_version, schedule_version
+           FROM reminders
+          WHERE workspace_id = :workspace_id
+            AND reminder_id = :reminder_id
+            AND deleted_at IS NULL
+          FOR UPDATE`,
+        { workspace_id: input.workspaceId, reminder_id: input.reminderId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const row = current.rows?.[0];
+      if (!row) {
+        await connection.rollback();
+        return 'not-found';
+      }
+      if (row.EDIT_VERSION !== input.expectedEditVersion) {
+        await connection.rollback();
+        return 'conflict';
+      }
+      await connection.execute(
+        `UPDATE reminders
+            SET paused_at = :paused_at,
+                next_due_at = NULL,
+                edit_version = edit_version + 1,
+                schedule_version = schedule_version + 1
+          WHERE workspace_id = :workspace_id
+            AND reminder_id = :reminder_id`,
+        {
+          paused_at: input.now,
+          workspace_id: input.workspaceId,
+          reminder_id: input.reminderId
+        }
+      );
+      await connection.commit();
+      return {
+        reminderId: input.reminderId,
+        title: row.TITLE,
+        note: row.NOTE ?? undefined,
+        schedule: JSON.parse(row.LOCAL_SCHEDULE_JSON) as ReminderSchedule,
+        nextDueAt: undefined,
+        pausedAt: input.now,
+        editVersion: row.EDIT_VERSION + 1,
+        scheduleVersion: row.SCHEDULE_VERSION + 1
+      };
+    });
+  }
+
+  async resumeReminder(input: {
+    workspaceId: string;
+    reminderId: string;
+    expectedEditVersion: number;
+    now: Date;
+    nextDueAt: Date | undefined;
+  }): Promise<ReminderRecord | 'not-found' | 'conflict'> {
+    return this.withConnection(async (connection) => {
+      const current = await connection.execute<{
+        TITLE: string;
+        NOTE: string | null;
+        LOCAL_SCHEDULE_JSON: string;
+        EDIT_VERSION: number;
+        SCHEDULE_VERSION: number;
+      }>(
+        `SELECT title, note, local_schedule_json, edit_version, schedule_version
+           FROM reminders
+          WHERE workspace_id = :workspace_id
+            AND reminder_id = :reminder_id
+            AND deleted_at IS NULL
+          FOR UPDATE`,
+        { workspace_id: input.workspaceId, reminder_id: input.reminderId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const row = current.rows?.[0];
+      if (!row) {
+        await connection.rollback();
+        return 'not-found';
+      }
+      if (row.EDIT_VERSION !== input.expectedEditVersion) {
+        await connection.rollback();
+        return 'conflict';
+      }
+      await connection.execute(
+        `UPDATE reminders
+            SET paused_at = NULL,
+                next_due_at = :next_due_at,
+                edit_version = edit_version + 1,
+                schedule_version = schedule_version + 1
+          WHERE workspace_id = :workspace_id
+            AND reminder_id = :reminder_id`,
+        {
+          next_due_at: input.nextDueAt ?? null,
+          workspace_id: input.workspaceId,
+          reminder_id: input.reminderId
+        }
+      );
+      await connection.commit();
+      return {
+        reminderId: input.reminderId,
+        title: row.TITLE,
+        note: row.NOTE ?? undefined,
+        schedule: JSON.parse(row.LOCAL_SCHEDULE_JSON) as ReminderSchedule,
+        nextDueAt: input.nextDueAt,
+        pausedAt: undefined,
+        editVersion: row.EDIT_VERSION + 1,
+        scheduleVersion: row.SCHEDULE_VERSION + 1
+      };
+    });
+  }
+
+  async deleteReminder(input: {
+    workspaceId: string;
+    reminderId: string;
+    expectedEditVersion: number;
+    now: Date;
+  }): Promise<'deleted' | 'not-found' | 'conflict'> {
+    return this.withConnection(async (connection) => {
+      const current = await connection.execute<{ EDIT_VERSION: number }>(
+        `SELECT edit_version
+           FROM reminders
+          WHERE workspace_id = :workspace_id
+            AND reminder_id = :reminder_id
+            AND deleted_at IS NULL
+          FOR UPDATE`,
+        { workspace_id: input.workspaceId, reminder_id: input.reminderId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const row = current.rows?.[0];
+      if (!row) {
+        await connection.rollback();
+        return 'not-found';
+      }
+      if (row.EDIT_VERSION !== input.expectedEditVersion) {
+        await connection.rollback();
+        return 'conflict';
+      }
+      await connection.execute(
+        `UPDATE reminders
+            SET deleted_at = :deleted_at,
+                paused_at = :deleted_at,
+                next_due_at = NULL,
+                edit_version = edit_version + 1,
+                schedule_version = schedule_version + 1
+          WHERE workspace_id = :workspace_id
+            AND reminder_id = :reminder_id`,
+        {
+          deleted_at: input.now,
+          workspace_id: input.workspaceId,
+          reminder_id: input.reminderId
+        }
+      );
+      await connection.commit();
+      return 'deleted';
+    });
+  }
+
+  async listRecipients(workspaceId: string): Promise<RecipientRecord[]> {
+    return this.withConnection(async (connection) => {
+      const rows = await connection.execute<{
+        RECIPIENT_ID: string;
+        EMAIL: string;
+        OWNERSHIP_VERIFIED_AT: Date | null;
+        CONSENTED_AT: Date | null;
+        UNSUBSCRIBED_AT: Date | null;
+        VERSION: number;
+      }>(
+        `SELECT recipient_id, email, ownership_verified_at, consented_at, unsubscribed_at, version
+           FROM recipients
+          WHERE workspace_id = :workspace_id
+          ORDER BY email`,
+        { workspace_id: workspaceId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      return (rows.rows ?? []).map((row) => ({
+        recipientId: row.RECIPIENT_ID,
+        email: row.EMAIL,
+        ownershipVerifiedAt: row.OWNERSHIP_VERIFIED_AT ?? undefined,
+        consentedAt: row.CONSENTED_AT ?? undefined,
+        unsubscribedAt: row.UNSUBSCRIBED_AT ?? undefined,
+        version: row.VERSION
+      }));
+    });
+  }
+
+  async setRecipientSubscription(input: {
+    workspaceId: string;
+    recipientId: string;
+    expectedVersion: number;
+    subscribed: boolean;
+    now: Date;
+  }): Promise<RecipientRecord | 'not-found' | 'conflict'> {
+    return this.withConnection(async (connection) => {
+      const current = await connection.execute<{
+        EMAIL: string;
+        OWNERSHIP_VERIFIED_AT: Date | null;
+        CONSENTED_AT: Date | null;
+        UNSUBSCRIBED_AT: Date | null;
+        VERSION: number;
+      }>(
+        `SELECT email, ownership_verified_at, consented_at, unsubscribed_at, version
+           FROM recipients
+          WHERE workspace_id = :workspace_id
+            AND recipient_id = :recipient_id
+          FOR UPDATE`,
+        { workspace_id: input.workspaceId, recipient_id: input.recipientId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const row = current.rows?.[0];
+      if (!row) {
+        await connection.rollback();
+        return 'not-found';
+      }
+      if (row.VERSION !== input.expectedVersion) {
+        await connection.rollback();
+        return 'conflict';
+      }
+      const consentedAt = input.subscribed ? row.CONSENTED_AT ?? input.now : null;
+      const unsubscribedAt = input.subscribed ? null : input.now;
+      await connection.execute(
+        `UPDATE recipients
+            SET consented_at = :consented_at,
+                unsubscribed_at = :unsubscribed_at,
+                version = version + 1
+          WHERE workspace_id = :workspace_id
+            AND recipient_id = :recipient_id`,
+        {
+          consented_at: consentedAt,
+          unsubscribed_at: unsubscribedAt,
+          workspace_id: input.workspaceId,
+          recipient_id: input.recipientId
+        }
+      );
+      await connection.commit();
+      return {
+        recipientId: input.recipientId,
+        email: row.EMAIL,
+        ownershipVerifiedAt: row.OWNERSHIP_VERIFIED_AT ?? undefined,
+        consentedAt: consentedAt ?? undefined,
+        unsubscribedAt: unsubscribedAt ?? undefined,
+        version: row.VERSION + 1
+      };
+    });
+  }
+
+  async listServices(workspaceId: string): Promise<Array<{ serviceId: string; name: string }>> {
+    return this.withConnection(async (connection) => {
+      const rows = await connection.execute<{ SERVICE_ID: string; NAME: string }>(
+        `SELECT service_id, name
+           FROM services
+          WHERE workspace_id = :workspace_id
+            AND deleted_at IS NULL
+          ORDER BY name`,
+        { workspace_id: workspaceId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      return (rows.rows ?? []).map((row) => ({ serviceId: row.SERVICE_ID, name: row.NAME }));
+    });
+  }
+
+  async createService(input: { workspaceId: string; serviceId: string; name: string }): Promise<{ serviceId: string; name: string }> {
+    return this.withConnection(async (connection) => {
+      await connection.execute(
+        `INSERT INTO services(workspace_id, service_id, name)
+         VALUES(:workspace_id, :service_id, :name)`,
+        {
+          workspace_id: input.workspaceId,
+          service_id: input.serviceId,
+          name: input.name
+        }
+      );
+      await connection.commit();
+      return { serviceId: input.serviceId, name: input.name };
+    });
+  }
+
+  async listPushMonitors(workspaceId: string): Promise<Array<{
+    monitorId: string;
+    serviceId: string;
+    state: 'healthy' | 'failing' | 'down' | 'unknown' | 'paused';
+    intervalMs: number;
+    graceMs: number;
+    pausedAt: Date | undefined;
+    lastEvidenceAt: Date | undefined;
+    editVersion: number;
+  }>> {
+    return this.withConnection(async (connection) => {
+      const rows = await connection.execute<{
+        MONITOR_ID: string;
+        SERVICE_ID: string;
+        STATE: 'healthy' | 'failing' | 'down' | 'unknown' | 'paused';
+        CONFIG_JSON: string;
+        PAUSED_AT: Date | null;
+        LAST_EVIDENCE_AT: Date | null;
+        EDIT_VERSION: number;
+      }>(
+        `SELECT monitor_id, service_id, state, config_json, paused_at, last_evidence_at, edit_version
+           FROM monitors
+          WHERE workspace_id = :workspace_id
+            AND mode = 'push'
+            AND deleted_at IS NULL
+          ORDER BY monitor_id`,
+        { workspace_id: workspaceId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      return (rows.rows ?? []).map((row) => {
+        const parsed = JSON.parse(row.CONFIG_JSON) as { intervalMs?: number; graceMs?: number };
+        return {
+          monitorId: row.MONITOR_ID,
+          serviceId: row.SERVICE_ID,
+          state: row.STATE,
+          intervalMs: Math.max(60_000, Number(parsed.intervalMs ?? 300_000)),
+          graceMs: Math.max(0, Number(parsed.graceMs ?? 120_000)),
+          pausedAt: row.PAUSED_AT ?? undefined,
+          lastEvidenceAt: row.LAST_EVIDENCE_AT ?? undefined,
+          editVersion: row.EDIT_VERSION
+        };
+      });
+    });
+  }
+
+  async createPushMonitor(input: {
+    workspaceId: string;
+    serviceId: string;
+    monitorId: string;
+    intervalMs: number;
+    graceMs: number;
+    startExpectingNow: boolean;
+    now: Date;
+    tokenHash: string;
+  }): Promise<
+    | {
+        monitorId: string;
+        serviceId: string;
+        state: 'healthy' | 'failing' | 'down' | 'unknown' | 'paused';
+        intervalMs: number;
+        graceMs: number;
+        pausedAt: Date | undefined;
+        lastEvidenceAt: Date | undefined;
+        editVersion: number;
+      }
+    | 'not-found'
+  > {
+    return this.withConnection(async (connection) => {
+      const serviceExists = await connection.execute(
+        `SELECT 1 FROM services
+          WHERE workspace_id = :workspace_id
+            AND service_id = :service_id
+            AND deleted_at IS NULL`,
+        { workspace_id: input.workspaceId, service_id: input.serviceId }
+      );
+      if (!serviceExists.rows?.length) {
+        await connection.rollback();
+        return 'not-found';
+      }
+      await connection.execute(
+        `INSERT INTO monitors(
+           workspace_id, monitor_id, service_id, mode, state, config_json, config_version, deadline_version, edit_version,
+           next_check_at, last_evidence_at
+         ) VALUES (
+           :workspace_id, :monitor_id, :service_id, 'push', 'unknown', :config_json, 1, 0, 1,
+           :next_check_at, :last_evidence_at
+         )`,
+        {
+          workspace_id: input.workspaceId,
+          monitor_id: input.monitorId,
+          service_id: input.serviceId,
+          config_json: JSON.stringify({ intervalMs: input.intervalMs, graceMs: input.graceMs }),
+          next_check_at: input.startExpectingNow ? input.now : null,
+          last_evidence_at: null
+        }
+      );
+      await connection.execute(
+        `INSERT INTO heartbeat_credentials(workspace_id, monitor_id, credential_version, token_hash)
+         VALUES(:workspace_id, :monitor_id, 1, HEXTORAW(:token_hash))`,
+        {
+          workspace_id: input.workspaceId,
+          monitor_id: input.monitorId,
+          token_hash: input.tokenHash
+        }
+      );
+      await connection.commit();
+      return {
+        monitorId: input.monitorId,
+        serviceId: input.serviceId,
+        state: 'unknown',
+        intervalMs: input.intervalMs,
+        graceMs: input.graceMs,
+        pausedAt: undefined,
+        lastEvidenceAt: undefined,
+        editVersion: 1
+      };
+    });
+  }
+
+  async rotatePushMonitorToken(input: {
+    workspaceId: string;
+    monitorId: string;
+    now: Date;
+    tokenHash: string;
+  }): Promise<'rotated' | 'not-found'> {
+    return this.withConnection(async (connection) => {
+      const exists = await connection.execute<{ V: number }>(
+        `SELECT MAX(credential_version) AS v
+           FROM heartbeat_credentials
+          WHERE workspace_id = :workspace_id
+            AND monitor_id = :monitor_id
+            AND revoked_at IS NULL`,
+        { workspace_id: input.workspaceId, monitor_id: input.monitorId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      const currentVersion = exists.rows?.[0]?.V;
+      if (!currentVersion) {
+        await connection.rollback();
+        return 'not-found';
+      }
+      await connection.execute(
+        `UPDATE heartbeat_credentials
+            SET revoked_at = :revoked_at
+          WHERE workspace_id = :workspace_id
+            AND monitor_id = :monitor_id
+            AND revoked_at IS NULL`,
+        {
+          revoked_at: input.now,
+          workspace_id: input.workspaceId,
+          monitor_id: input.monitorId
+        }
+      );
+      await connection.execute(
+        `INSERT INTO heartbeat_credentials(workspace_id, monitor_id, credential_version, token_hash)
+         VALUES(:workspace_id, :monitor_id, :credential_version, HEXTORAW(:token_hash))`,
+        {
+          workspace_id: input.workspaceId,
+          monitor_id: input.monitorId,
+          credential_version: Number(currentVersion) + 1,
+          token_hash: input.tokenHash
+        }
+      );
+      await connection.commit();
+      return 'rotated';
+    });
+  }
+
   async runReminderSchedulerTick(now: Date, limit: number): Promise<number> {
     return this.withConnection(async (connection) => {
       const due = await connection.execute<{
@@ -344,6 +873,49 @@ export class OracleAppRepository implements AppRepository {
       );
       const items: NotificationWorkItem[] = [];
       for (const row of rows.rows ?? []) {
+        const [kind, reminderId, occurrenceVersion] = row.EVENT_ID.split(':');
+        if (kind === 'reminder' && reminderId && occurrenceVersion) {
+          const reminder = await connection.execute<{ SCHEDULE_VERSION: number; PAUSED_AT: Date | null; DELETED_AT: Date | null }>(
+            `SELECT schedule_version, paused_at, deleted_at
+               FROM reminders
+              WHERE workspace_id = :workspace_id
+                AND reminder_id = :reminder_id`,
+            { workspace_id: row.WORKSPACE_ID, reminder_id: reminderId },
+            { outFormat: oracledb.OUT_FORMAT_OBJECT }
+          );
+          const active = reminder.rows?.[0];
+          const requiredVersion = Number(occurrenceVersion);
+          const validVersion = Number.isFinite(requiredVersion) && active?.SCHEDULE_VERSION === requiredVersion + 1;
+          if (!active || active.PAUSED_AT || active.DELETED_AT || !validVersion) {
+            await connection.execute(
+              `UPDATE notifications
+                  SET state = 'suppressed', updated_at = :now
+                WHERE workspace_id = :workspace_id AND notification_id = :notification_id`,
+              { now, workspace_id: row.WORKSPACE_ID, notification_id: row.NOTIFICATION_ID }
+            );
+            continue;
+          }
+        }
+        const recipientAllowed = await connection.execute<{ OK: number }>(
+          `SELECT 1 AS ok
+             FROM recipients
+            WHERE workspace_id = :workspace_id
+              AND recipient_id = :recipient_id
+              AND ownership_verified_at IS NOT NULL
+              AND consented_at IS NOT NULL
+              AND unsubscribed_at IS NULL`,
+          { workspace_id: row.WORKSPACE_ID, recipient_id: row.RECIPIENT_ID },
+          { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+        if (!recipientAllowed.rows?.length) {
+          await connection.execute(
+            `UPDATE notifications
+                SET state = 'suppressed', updated_at = :now
+              WHERE workspace_id = :workspace_id AND notification_id = :notification_id`,
+            { now, workspace_id: row.WORKSPACE_ID, notification_id: row.NOTIFICATION_ID }
+          );
+          continue;
+        }
         const attempts = await connection.execute<{ C: number }>(
           `SELECT COUNT(*) AS c FROM notification_attempts WHERE workspace_id = :workspace_id AND notification_id = :notification_id`,
           { workspace_id: row.WORKSPACE_ID, notification_id: row.NOTIFICATION_ID },
@@ -435,15 +1007,15 @@ export class OracleAppRepository implements AppRepository {
   }
 
   async dashboard(workspaceId: string): Promise<{
-    reminders: Array<{ id: string; title: string; nextDueAt: string; state: string }>;
+    reminders: Array<{ id: string; title: string; nextDueAt: string; state: string; editVersion: number }>;
     services: Array<{ id: string; name: string; pullState: string | undefined; pushState: string | undefined }>;
     incidents: Array<{ id: string; service: string; mode: string; openedAt: string }>;
     notifications: Array<{ id: string; subject: string; state: string; updatedAt: string }>;
     quota: { rolling24h: number; rolling24hLimit: number; monthly: number; monthlyLimit: number };
   }> {
     return this.withConnection(async (connection) => {
-      const reminders = await connection.execute<{ REMINDER_ID: string; TITLE: string; NEXT_DUE_AT: Date | null; PAUSED_AT: Date | null }>(
-        `SELECT reminder_id, title, next_due_at, paused_at
+      const reminders = await connection.execute<{ REMINDER_ID: string; TITLE: string; NEXT_DUE_AT: Date | null; PAUSED_AT: Date | null; EDIT_VERSION: number }>(
+        `SELECT reminder_id, title, next_due_at, paused_at, edit_version
            FROM reminders
           WHERE workspace_id = :workspace_id AND deleted_at IS NULL
           ORDER BY next_due_at NULLS LAST`,
@@ -485,7 +1057,8 @@ export class OracleAppRepository implements AppRepository {
           id: row.REMINDER_ID,
           title: row.TITLE,
           nextDueAt: row.NEXT_DUE_AT?.toISOString() ?? 'none',
-          state: row.PAUSED_AT ? 'paused' : row.NEXT_DUE_AT ? 'active' : 'completed'
+          state: row.PAUSED_AT ? 'paused' : row.NEXT_DUE_AT ? 'active' : 'completed',
+          editVersion: row.EDIT_VERSION
         })),
         services: [{ id: 'pull-disabled', name: 'Pull monitor execution', pullState: 'disabled', pushState: undefined }],
         incidents: [],

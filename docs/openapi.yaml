@@ -50,6 +50,10 @@ paths:
       summary: Record verified ownership and explicit email consent, or unsubscribe
       parameters: [ { name: recipientId, in: path, required: true, schema: { type: string, format: uuid } } ]
       responses: { '200': { description: Preferences updated } }
+  /api/recipients:
+    get:
+      summary: List workspace recipients and subscription status
+      responses: { '200': { description: Recipients } }
   /api/services:
     get:
       summary: List services and independent pull/push monitor states
@@ -123,9 +127,11 @@ x-implementation-status:
     - session/invite/CSRF primitives
     - push heartbeat service and Oracle atomic receipt adapter
     - leases, fencing, dispatch suppression, retry, and quota primitives
-    - authenticated invite verification/session, reminder creation/list/preview, and workspace dashboard routes
+    - authenticated invite verification/session, reminder creation/list/preview/edit/pause/resume/delete routes
+    - workspace recipient listing and subscription preference updates
+    - workspace service create/list, push monitor create/list, and token rotation routes
     - scheduler and email-worker process loops with Oracle-backed reminder/notification persistence
   disabled-or-contract-only:
     - outbound pull execution
-    - monitor authorization/rotation/test endpoints
-    - full owner API surface outside invite/auth/reminder/dashboard vertical slice
+    - monitor authorization/test endpoints
+    - deadline evaluator, incident creation/recovery flow, and maintenance APIs
