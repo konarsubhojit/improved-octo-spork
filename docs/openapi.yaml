@@ -1,0 +1,125 @@
+openapi: 3.1.0
+info:
+  title: Reminders and Service Monitor API
+  version: 0.2.0
+  description: >
+    Same-origin, invite-only workspace API. Owner endpoints require an HttpOnly secure session
+    cookie and X-CSRF-Token for mutations. The heartbeat endpoint uses its path token only.
+servers:
+  - url: https://reminders.example.com
+security:
+  - sessionCookie: []
+paths:
+  /api/auth/verify:
+    post:
+      summary: Consume a one-use email verification token and create a session
+      responses: { '204': { description: Verified }, '400': { $ref: '#/components/responses/Error' } }
+  /api/invites:
+    post:
+      summary: Create an expiring invite (bootstrap CLI uses the same service, never a public admin route)
+      responses: { '201': { description: Invite created }, '403': { $ref: '#/components/responses/Error' } }
+  /api/dashboard:
+    get:
+      summary: Workspace-scoped reminder, independent monitor, incident, notification, and quota summary
+      responses: { '200': { description: Dashboard }, '401': { $ref: '#/components/responses/Error' } }
+  /api/reminders:
+    get:
+      summary: List workspace reminders
+      responses: { '200': { description: Reminders } }
+    post:
+      summary: Create one-time, daily, weekday, monthly, or elapsed reminder
+      responses: { '201': { description: Reminder created }, '422': { $ref: '#/components/responses/Error' } }
+  /api/reminders/preview:
+    post:
+      summary: Preview the next five occurrences without saving
+      responses: { '200': { description: Occurrence instants and scheduling policy } }
+  /api/reminders/{reminderId}:
+    parameters: [ { $ref: '#/components/parameters/ReminderId' } ]
+    patch:
+      summary: Optimistically edit, pause, or resume a reminder
+      responses: { '200': { description: Updated }, '409': { $ref: '#/components/responses/Error' } }
+    delete:
+      summary: Revoke pending work and schedule live-data purge
+      responses: { '204': { description: Deleted } }
+  /api/recipients/{recipientId}/subscription:
+    put:
+      summary: Record verified ownership and explicit email consent, or unsubscribe
+      parameters: [ { name: recipientId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses: { '200': { description: Preferences updated } }
+  /api/services:
+    get:
+      summary: List services and independent pull/push monitor states
+      responses: { '200': { description: Services } }
+    post:
+      summary: Create a service
+      responses: { '201': { description: Created } }
+  /api/services/{serviceId}/monitors:
+    post:
+      summary: Add a pull or push monitor
+      parameters: [ { name: serviceId, in: path, required: true, schema: { type: string, format: uuid } } ]
+      responses: { '201': { description: Created; push URL is returned once } }
+  /api/monitors/{monitorId}/authorize:
+    post:
+      summary: Verify DNS TXT or exact-host HTTPS target control through the restricted probe role
+      parameters: [ { $ref: '#/components/parameters/MonitorId' } ]
+      responses: { '200': { description: Authorized }, '422': { $ref: '#/components/responses/Error' } }
+  /api/monitors/{monitorId}/rotate:
+    post:
+      summary: Revoke the old push token and return the replacement once
+      parameters: [ { $ref: '#/components/parameters/MonitorId' } ]
+      responses: { '200': { description: Rotated } }
+  /api/monitors/{monitorId}/test:
+    post:
+      summary: Rate-limited, authorized test check
+      parameters: [ { $ref: '#/components/parameters/MonitorId' } ]
+      responses: { '202': { description: Queued }, '429': { $ref: '#/components/responses/Error' } }
+  /api/maintenance:
+    post:
+      summary: Start or end workspace/service maintenance
+      responses: { '200': { description: Maintenance changed } }
+  /api/incidents:
+    get:
+      summary: List workspace incident transitions
+      responses: { '200': { description: Incidents } }
+  /api/notifications:
+    get:
+      summary: List notification history, attempts, and quota visibility
+      responses: { '200': { description: Notifications } }
+  /h/{token}:
+    post:
+      security: []
+      summary: Submit a push heartbeat; body and client timestamps are ignored
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string, minLength: 43, maxLength: 43 }
+        - name: Idempotency-Key
+          in: header
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        content: { application/octet-stream: { schema: { type: string, maxLength: 1024 } } }
+      responses:
+        '204': { description: Accepted or duplicate }
+        '404': { description: Invalid or revoked token }
+        '413': { description: Body too large }
+components:
+  securitySchemes:
+    sessionCookie: { type: apiKey, in: cookie, name: __Host-session }
+  parameters:
+    ReminderId: { name: reminderId, in: path, required: true, schema: { type: string, format: uuid } }
+    MonitorId: { name: monitorId, in: path, required: true, schema: { type: string, format: uuid } }
+  responses:
+    Error:
+      description: Safe error response without credentials or heartbeat paths
+x-implementation-status:
+  implemented-and-unit-tested:
+    - recurrence and preview engine
+    - monitor state machines
+    - session/invite/CSRF primitives
+    - push heartbeat service and Oracle atomic receipt adapter
+    - leases, fencing, dispatch suppression, retry, and quota primitives
+  disabled-or-contract-only:
+    - owner API routing
+    - outbound pull execution
+    - scheduler and SMTP worker process loops

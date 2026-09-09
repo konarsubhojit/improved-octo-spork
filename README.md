@@ -1,173 +1,123 @@
-# Trial Expiry Reminder
+# Reminders and two-way service monitoring
 
-A zero-cost, fully serverless application that reminds you before a free trial turns into a paid
-subscription. It runs entirely inside the **AWS Always Free Tier**:
+This repository is migrating from the archived AWS trial-reminder prototype to an invite-only
+personal reminder and service-monitoring application for an **existing** GCP micro VM, Oracle
+Autonomous Transaction Processing database, and Gmail SMTP. Nothing here provisions, deploys,
+sends live email, or performs a live probe.
 
-- **Amazon DynamoDB** (On-Demand) stores the reminders.
-- **AWS Lambda** (Node.js 20.x, ESM) exposes a REST API through a **Lambda Function URL**.
-- **Amazon EventBridge** triggers a daily Lambda at **09:00 UTC** that emails the reminders due today
-  through **Gmail SMTP** (Nodemailer).
-- A single-file **HTML/Vanilla JS** dashboard (`public/index.html`) creates, lists and deletes reminders.
+The MVP foundation includes:
 
-## Architecture
+- local-wall-time and fixed-elapsed recurrence with five-occurrence previews;
+- independent pull and push monitor state machines;
+- 256-bit push credentials (only SHA-256 hashes are persisted), bounded idempotent heartbeat ingress;
+- expiring one-use invite/session primitives, CSRF checks, and workspace isolation helpers;
+- durable job lease/fence, notification suppression/retry/quota primitives;
+- an Oracle-compatible tenant-scoped schema and atomic push receipt adapter;
+- an OpenAPI contract and prebuilt React dashboard shell.
 
-```text
-public/index.html ──HTTPS──▶ ApiFunction (Lambda Function URL) ──▶ DynamoDB (RemindersTable)
-                                                                        ▲
-EventBridge cron(0 9 * * ? *) ──▶ DailyNotifierFunction ──Gmail SMTP──▶ │ status: PENDING → SENT
-```
+## Current implementation boundary
 
-### Data model (`RemindersTable`)
+This is intentionally a secure foundation rather than a claim that the entire production system is
+finished. The push heartbeat service and Oracle adapter are implemented. Core policies are
+unit-tested. Owner API routing, bootstrap CLI, scheduler/email-worker loops, and target authorization
+workers remain contract-only. **Outbound pull execution is fail-closed**, because this repository
+does not yet demonstrate the required DNS pinning, TLS/SNI validation, redirect/header/body/time
+bounds, process isolation, and independent egress containment. Do not enable it by substituting a
+normal `fetch`.
 
-| Attribute       | Type   | Notes                                          |
-| --------------- | ------ | ---------------------------------------------- |
-| `reminder_date` | String | Partition key, `YYYY-MM-DD` (the day to email) |
-| `reminder_id`   | String | Sort key, UUID v4                              |
-| `serviceName`   | String | Trial/service name                             |
-| `expiryDate`    | String | `YYYY-MM-DD` trial expiry date                 |
-| `customNote`    | String | Optional note shown in the email               |
-| `userEmail`     | String | Recipient                                      |
-| `status`        | String | `PENDING` or `SENT`                            |
-| `createdAt`     | String | ISO timestamp                                  |
-| `sentAt`        | String | ISO timestamp, set when the email is delivered |
+The former unauthenticated AWS Function URL, DynamoDB implementation, and SAM template are retained
+only as migration reference in [`docs/legacy-aws.md`](docs/legacy-aws.md) and `template.yaml`. They
+must not be deployed or exposed as an alternate API.
 
-`StatusIndex` (GSI) uses `status` as the partition key and `reminder_date` as the sort key, so both the
-"list pending reminders" API call and the daily job are single, cheap `Query` operations.
+## Scheduling and state policy
 
-## Project structure
+- Due instants are UTC; IANA zone and original local recurrence are retained.
+- Calendar schedules preserve wall time. A nonexistent time advances to the first valid instant
+  after the gap; a duplicated time uses the earlier occurrence once.
+- Missing monthly dates are skipped. An elapsed 24 hours is distinct from daily local time.
+- A one-time occurrence less than 24 hours overdue is late; at 24 hours it is missed. Recurring
+  consumers must coalesce backlog to at most one recent late occurrence.
+- Pull: three completed target failures cause `down`; two successes recover. Infrastructure failure
+  or missing coverage becomes `unknown` and does not count against the target.
+- Push: receipt time is authoritative. At interval age it remains healthy, then is failing during
+  grace, then down. One fresh heartbeat recovers. New monitors remain unknown until a first receipt
+  unless “start expecting now” is explicitly selected.
+- Pull and push incidents are separate. Maintenance observes but suppresses notifications. Pause,
+  resume, configuration edits, and deletion invalidate stale queued work.
 
-```text
-├── template.yaml            # AWS SAM template (DynamoDB, Lambdas, Function URL, schedule, IAM)
-├── package.json             # Runtime dependencies and tests
-├── src/
-│   ├── handlers/
-│   │   ├── api.mjs          # CRUD routes behind the Lambda Function URL
-│   │   └── notifier.mjs     # Daily cron processor & Gmail SMTP dispatcher
-│   └── utils/
-│       ├── db.mjs           # DynamoDB DocumentClient helper
-│       └── mailer.mjs       # Nodemailer transport & HTML template generator
-├── public/index.html        # Static dashboard
-└── tests/                   # node:test unit tests
-```
+## Email policy
 
-## API
+Only verified recipients with explicit active consent are eligible. Verification is the sole
+bounded pre-consent exception. Workers must recheck the occurrence/configuration version,
+cancellation, consent, maintenance, and quotas immediately before submission.
 
-Base URL = the `ApiFunctionUrl` stack output.
+The application ceiling is 100 recipient-attempts per rolling 24 hours, with 20 places withheld
+from reminders for verification/incidents, plus 2,500 per calendar month. Reservations must be
+atomic in Oracle. Retry uses bounded exponential backoff with jitter and stops after five attempts.
+SMTP acceptance is not delivery or reading. An interrupted/ambiguous submission is
+`outcome-unknown` and may have produced a duplicate; exactly-once email is not promised. Automated
+bounce and delivery tracking are deferred.
 
-### `POST /reminders`
+## Local development
 
-```json
-{
-  "serviceName": "Netflix",
-  "expiryDate": "2026-03-10",
-  "userEmail": "you@example.com",
-  "customNote": "Cancel from the billing page",
-  "reminderOffsets": [3, 1, 0]
-}
-```
-
-- `reminderOffsets` (optional) — days *before* `expiryDate` to send a reminder. Defaults to
-  `[3, 1, 0]` (3 days before, 1 day before, and on the expiry day).
-- `reminderDates` (optional) — explicit `YYYY-MM-DD` dates instead of offsets.
-- One DynamoDB item is created per reminder date. Responds `201` with the created items.
-
-### `GET /reminders`
-
-Returns every `PENDING` reminder, sorted by reminder date:
-
-```json
-{ "count": 3, "reminders": [ { "reminder_date": "2026-03-07", "reminder_id": "…", "…": "…" } ] }
-```
-
-### `DELETE /reminders/{reminder_date}/{reminder_id}`
-
-Cancels a single reminder. Responds `404` when it does not exist.
-
-## Prerequisites
-
-- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
-- AWS credentials with permission to deploy CloudFormation stacks (`aws configure`)
-- Node.js 20+
-- A Gmail account with 2-Step Verification enabled
-
-## Generating a Google App Password
-
-Gmail rejects your normal account password over SMTP; you need a 16-character App Password:
-
-1. Open <https://myaccount.google.com/security> and enable **2-Step Verification**.
-2. Go to <https://myaccount.google.com/apppasswords>.
-3. Enter an app name such as `Trial Expiry Reminder` and click **Create**.
-4. Copy the generated 16-character password (spaces can be removed) — this is `GMAIL_APP_PASSWORD`.
-5. Your Gmail address is `GMAIL_USER`.
-
-Google's free SMTP relay allows roughly 500 messages per day, which is far more than this app needs.
-
-## Build & deploy
+Node.js 24 is used by the current toolchain.
 
 ```bash
-npm install          # optional, only needed to run the unit tests locally
-sam build
-sam deploy --guided
-```
-
-During `sam deploy --guided` you will be asked for:
-
-| Parameter          | Value                                                          |
-| ------------------ | -------------------------------------------------------------- |
-| `GmailUser`        | `you@gmail.com`                                                 |
-| `GmailAppPassword` | The 16-character App Password (stored with `NoEcho`)            |
-| `CorsAllowOrigin`  | `*`, or the origin that hosts `public/index.html`               |
-
-Answer **yes** to *"ApiFunction Function Url may not have authorization defined, Is this okay?"* — the
-Function URL is intentionally public so the static dashboard can call it.
-
-Subsequent deployments only need:
-
-```bash
-sam build && sam deploy
-```
-
-To update the Gmail credentials later:
-
-```bash
-sam deploy --parameter-overrides GmailUser=you@gmail.com GmailAppPassword=xxxxxxxxxxxxxxxx
-```
-
-## Using the dashboard
-
-1. Copy the `ApiFunctionUrl` value printed in the stack outputs.
-2. Open `public/index.html` in your browser (or host it on S3/GitHub Pages).
-3. Paste the Function URL into the **Lambda Function URL** field — it is remembered in `localStorage`.
-4. Create, list and delete reminders.
-
-## Testing the notifier manually
-
-```bash
-sam local invoke DailyNotifierFunction --env-vars env.json   # local run
-aws lambda invoke --function-name <DailyNotifierFunction-name> /dev/stdout   # deployed run
-```
-
-`env.json` for local runs:
-
-```json
-{ "DailyNotifierFunction": { "TABLE_NAME": "<table>", "GMAIL_USER": "you@gmail.com", "GMAIL_APP_PASSWORD": "xxxx" } }
-```
-
-## Unit tests
-
-```bash
-npm install
+npm ci
+npm run typecheck
+npm run test:core
 npm test
+npm run build
 ```
 
-The tests cover date maths, input validation and the HTML email rendering (including escaping of
-user-supplied notes); they do not require AWS credentials.
+Tests use no credentials, SMTP, Oracle, DNS, HTTP targets, or cloud resources. The React build emits
+static files under ignored `dist/`.
 
-## Cost
+Configuration names are shown in `.env.example` with dummy values. Never commit an `.env`, Oracle
+wallet, app password, token, recipient address, or cloud credential. The probe role rejects database
+and email credentials. Heartbeat token paths must be redacted from reverse-proxy access logs and
+must never appear in application logs, traces, error reports, analytics, or UI history.
 
-| Service     | Free tier                          | Typical usage    |
-| ----------- | ---------------------------------- | ---------------- |
-| Lambda      | 1M requests + 400k GB-s per month  | ~30 invocations  |
-| DynamoDB    | 25 GB storage, On-Demand           | a few KB         |
-| EventBridge | Scheduled rules are free           | 1 rule           |
-| Gmail SMTP  | Free                               | a few emails/day |
+## Oracle schema and API
+
+- [`migrations/001_mvp.sql`](migrations/001_mvp.sql) contains versioned Oracle DDL. It has not been
+  executed against Oracle. Review identifiers, JSON checks, timestamp bindings, conditional unique
+  indexes, wallet/connectivity, and the documented `FOR UPDATE SKIP LOCKED` claim transaction on the
+  exact existing service first.
+- [`docs/openapi.yaml`](docs/openapi.yaml) documents reminder CRUD/preview/pause/resume,
+  subscriptions, services/monitors, authorization, rotation, test checks, maintenance, incidents,
+  notification history, authentication, and ingestion. Its implementation-status extension clearly
+  separates working code from contract-only routes.
+
+All owned rows carry `workspace_id`; composite foreign keys prevent cross-workspace references.
+Every runtime query must be workspace-scoped and parameter-bound. Optimistic edit and schedule/config
+versions are distinct from push deadline versions.
+
+## Manual production prerequisites (do not execute from this repository)
+
+1. Validate that the existing GCP VM, public IP, Oracle Always Free service, traffic, storage, and
+   Gmail use remain within account-specific limits. “Free” is an intent, not a guarantee; there is no
+   paid fallback.
+2. Configure a trusted HTTPS origin and proxy headers. Bind API, scheduler, email worker, and
+   internal probe job/result interfaces privately by default.
+3. Create separate least-privilege Oracle users. Only the email worker receives Gmail SMTP
+   credentials; only the probe process receives network jobs, never Oracle or Gmail credentials.
+4. Put secrets outside environment files in the public repository. Configure TLS to Gmail on 587
+   (STARTTLS) or 465 using an app password, not Gmail API/OAuth.
+5. Independently validate probe egress restrictions and pinned-address connection behavior before
+   implementing/enabling execution. Deny deployment, internal, metadata, private, reserved,
+   loopback, link-local, and multicast destinations on every resolution.
+6. Configure a supervisor for separate roles, roughly 10-second due scans, bounded concurrency,
+   lease reclamation, readiness and metrics. The objectives (not guarantees) are 99% of due reminders
+   queued within 60 seconds and heartbeat evaluation lag at most 30 seconds under normal load.
+7. Arrange independent external monitoring for public ingress before relying on push coverage.
+
+Initial unvalidated pilot limits are 10 users, 50 reminders, 10 pull monitors, 10 push monitors, and
+five-minute checks (one-minute hard minimum for pull). Suggested configurable retention is seven
+days for raw observations, 90 days for incidents/notifications, and 180 days for audit events.
+Deletion revokes tokens and queued work immediately; target live-data purge is within 30 days.
+Backups, disaster recovery, RPO/RTO, and tested restore are explicitly deferred.
+
+No Oracle/live network integration, SMTP, load, failover, or deployment validation has been
+performed. Do not merge or deploy until those prerequisites and remaining contract-only features
+are reviewed and completed.

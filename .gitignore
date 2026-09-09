@@ -3,3 +3,11 @@ node_modules/
 samconfig.toml
 *.log
 .env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.jks
+wallet/
+Wallet_*/
+dist/
